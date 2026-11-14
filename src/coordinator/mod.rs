@@ -108,12 +108,34 @@ impl ContactCoordinator {
 
                 tokio::select! {
                     _ = sleep(delay) => {
+                        let current_now = OffsetDateTime::now_utc();
+                        if current_now < next_start {
+                            let remaining = (next_start - current_now).try_into().unwrap_or(Duration::ZERO);
+                            if !remaining.is_zero() {
+                                tokio::select! {
+                                    _ = sleep(remaining) => {}
+                                    _ = cancel.cancelled() => {
+                                        info!("cancellation requested, exiting ContactCoordinator");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
                         info!(
                             "contact window opened for {}: initiating contact (duration={:?})",
                             target.callsign, duration
                         );
                         if let Err(err) = self.endpoint.start_contact(&target.callsign, target.node_id.as_ref()).await {
                             error!("failed to start contact with {}: {err}", target.callsign);
+                            // Prevent tight retry spin loop if start_contact fails within the same window
+                            tokio::select! {
+                                _ = sleep(Duration::from_secs(1)) => {}
+                                _ = cancel.cancelled() => {
+                                    info!("cancellation requested, exiting ContactCoordinator");
+                                    break;
+                                }
+                            }
                         } else {
                             // Wait for duration of contact
                             tokio::select! {

@@ -185,8 +185,17 @@ pub fn infer_mime_type(data: &[u8]) -> (&'static str, bool) {
         return ("application/x-tar", true);
     }
 
-    // Check if valid UTF-8 text
-    if let Ok(text) = std::str::from_utf8(data) {
+    // Check if valid UTF-8 text (bounded prefix to avoid multi-MB full scans on large files)
+    let prefix = &data[..data.len().min(65_536)];
+    let utf8_prefix = match std::str::from_utf8(prefix) {
+        Ok(s) => Some(s),
+        Err(e) if e.valid_up_to() > 0 && prefix.len() == 65_536 => {
+            std::str::from_utf8(&prefix[..e.valid_up_to()]).ok()
+        }
+        Err(_) => None,
+    };
+
+    if let Some(text) = utf8_prefix {
         let trimmed = text.trim_start();
         if trimmed.starts_with("<svg")
             || ((trimmed.starts_with("<?xml") || trimmed.starts_with("<!DOCTYPE"))
@@ -209,7 +218,11 @@ pub fn infer_mime_type(data: &[u8]) -> (&'static str, bool) {
             return ("application/vnd.google-earth.kml+xml", false);
         }
 
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+        if data.len() <= 262_144
+            && (trimmed.starts_with('{') || trimmed.starts_with('['))
+            && let Ok(full_text) = std::str::from_utf8(data)
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(full_text)
+        {
             let is_senml = if let Some(arr) = val.as_array() {
                 arr.iter().any(|item| {
                     item.get("n").is_some() || item.get("v").is_some() || item.get("bn").is_some()

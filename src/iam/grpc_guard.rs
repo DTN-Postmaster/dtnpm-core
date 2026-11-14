@@ -3,13 +3,21 @@
 //! Enforces Bearer token authentication, Rego PBAC authorization, and Unix Domain Socket
 //! transport in front of [`hardy_proto::server::GrpcServer`] without requiring changes to upstream `hardy-proto`.
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use hardy_async::CancellationToken;
+use hardy_async::{CancellationToken, async_trait};
+use hardy_bpa::bpa::BpaRegistration;
+use hardy_bpa::cla::{self, Cla, ClaInit};
+use hardy_bpa::policy::FlowControllerFactory;
+use hardy_bpa::routing::{self, RoutingAgent};
+use hardy_bpa::services::{self, Application, Service};
 use http::{HeaderValue, Request, Response, StatusCode, header};
 use http_body_util::{Either, Empty};
 use hyper::body::Incoming;
@@ -24,6 +32,204 @@ use crate::iam::policy::{ContextInput, PolicyEngine, RegoInput, RequestInput, Us
 use crate::internal_storage::InternalStorage;
 
 type GuardBody = Either<Incoming, Empty<Bytes>>;
+
+const GATE_TICKET_TTL: Duration = Duration::from_secs(10);
+const MAX_GATE_TICKETS: usize = 256;
+
+/// Classification of BPA registration operations authorized by [`GrpcSecurityGateway`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcRegistrationKind {
+    Cla,
+    Service,
+    Application,
+    Routing,
+}
+
+impl GrpcRegistrationKind {
+    #[must_use]
+    fn from_grpc_path(path: &str) -> Option<Self> {
+        match path {
+            "/cla.Cla/Register" => Some(Self::Cla),
+            "/service.Service/Register" => Some(Self::Service),
+            "/service.Application/Register" => Some(Self::Application),
+            "/routing.RoutingAgent/Register" => Some(Self::Routing),
+            _ => None,
+        }
+    }
+}
+
+struct GateTicket {
+    id: u64,
+    kind: GrpcRegistrationKind,
+    expires_at: Instant,
+}
+
+/// Short-lived authorization gate bridging [`GrpcSecurityGateway`] and the internal
+/// loopback [`hardy_proto::server::GrpcServer`].
+///
+/// Prevents local unprivileged processes from bypassing gateway authentication and PBAC
+/// by connecting directly to the internal ephemeral loopback socket.
+#[derive(Default)]
+pub struct GrpcRegistrationGate {
+    next_id: AtomicU64,
+    tickets: Mutex<VecDeque<GateTicket>>,
+}
+
+impl GrpcRegistrationGate {
+    /// Creates an empty registration authorization gate.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn grant_ticket(&self, kind: GrpcRegistrationKind) -> Option<u64> {
+        let now = Instant::now();
+        let mut queue = self.tickets.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(front) = queue.front() {
+            if front.expires_at <= now {
+                queue.pop_front();
+            } else {
+                break;
+            }
+        }
+        if queue.len() >= MAX_GATE_TICKETS {
+            queue.pop_front();
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        queue.push_back(GateTicket {
+            id,
+            kind,
+            expires_at: now + GATE_TICKET_TTL,
+        });
+        Some(id)
+    }
+
+    fn revoke_ticket(&self, id: u64) {
+        let mut queue = self.tickets.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = queue.iter().position(|t| t.id == id) {
+            queue.remove(pos);
+        }
+    }
+
+    fn consume_ticket(&self, kind: GrpcRegistrationKind) -> bool {
+        let now = Instant::now();
+        let mut queue = self.tickets.lock().unwrap_or_else(|e| e.into_inner());
+        queue.retain(|t| t.expires_at > now);
+        if let Some(pos) = queue.iter().position(|t| t.kind == kind) {
+            queue.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Wraps a [`BpaRegistration`] target and rejects registrations that were not authorized
+/// through [`GrpcSecurityGateway`].
+pub struct GuardedBpaRegistration {
+    inner: Arc<dyn BpaRegistration>,
+    gate: Arc<GrpcRegistrationGate>,
+}
+
+impl GuardedBpaRegistration {
+    /// Wraps `inner` with an authorization check against `gate`.
+    #[must_use]
+    pub fn new(inner: Arc<dyn BpaRegistration>, gate: Arc<GrpcRegistrationGate>) -> Self {
+        Self { inner, gate }
+    }
+
+    fn denied_box_err(op: &str) -> Box<dyn std::error::Error + Send + Sync> {
+        warn!(
+            operation = op,
+            "Rejected direct unauthenticated registration bypassing GrpcSecurityGateway"
+        );
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("Direct unauthenticated gRPC registration '{op}' bypassing gateway denied"),
+        ))
+    }
+}
+
+#[async_trait]
+impl BpaRegistration for GuardedBpaRegistration {
+    async fn register_cla(
+        &self,
+        name: String,
+        cla: Arc<dyn Cla>,
+        policy: Option<Arc<dyn FlowControllerFactory>>,
+        init: ClaInit,
+    ) -> cla::Result<Vec<hardy_bpv7::eid::NodeId>> {
+        if !self.gate.consume_ticket(GrpcRegistrationKind::Cla) {
+            return Err(cla::Error::Internal(Self::denied_box_err("register_cla")));
+        }
+        self.inner.register_cla(name, cla, policy, init).await
+    }
+
+    async fn register_service(
+        &self,
+        service_id: hardy_bpv7::eid::Service,
+        service: Arc<dyn Service>,
+    ) -> services::Result<hardy_bpv7::eid::Eid> {
+        if !self.gate.consume_ticket(GrpcRegistrationKind::Service) {
+            return Err(services::Error::Internal(Self::denied_box_err(
+                "register_service",
+            )));
+        }
+        self.inner.register_service(service_id, service).await
+    }
+
+    async fn register_application(
+        &self,
+        service_id: hardy_bpv7::eid::Service,
+        application: Arc<dyn Application>,
+    ) -> services::Result<hardy_bpv7::eid::Eid> {
+        if !self.gate.consume_ticket(GrpcRegistrationKind::Application) {
+            return Err(services::Error::Internal(Self::denied_box_err(
+                "register_application",
+            )));
+        }
+        self.inner
+            .register_application(service_id, application)
+            .await
+    }
+
+    async fn register_dynamic_service(
+        &self,
+        service: Arc<dyn Service>,
+    ) -> services::Result<hardy_bpv7::eid::Eid> {
+        if !self.gate.consume_ticket(GrpcRegistrationKind::Service) {
+            return Err(services::Error::Internal(Self::denied_box_err(
+                "register_dynamic_service",
+            )));
+        }
+        self.inner.register_dynamic_service(service).await
+    }
+
+    async fn register_dynamic_application(
+        &self,
+        application: Arc<dyn Application>,
+    ) -> services::Result<hardy_bpv7::eid::Eid> {
+        if !self.gate.consume_ticket(GrpcRegistrationKind::Application) {
+            return Err(services::Error::Internal(Self::denied_box_err(
+                "register_dynamic_application",
+            )));
+        }
+        self.inner.register_dynamic_application(application).await
+    }
+
+    async fn register_routing_agent(
+        &self,
+        name: String,
+        agent: Arc<dyn RoutingAgent>,
+    ) -> routing::Result<Vec<hardy_bpv7::eid::NodeId>> {
+        if !self.gate.consume_ticket(GrpcRegistrationKind::Routing) {
+            return Err(routing::Error::Internal(Self::denied_box_err(
+                "register_routing_agent",
+            )));
+        }
+        self.inner.register_routing_agent(name, agent).await
+    }
+}
 
 /// Maps a gRPC HTTP/2 URI path (e.g. `"/cla.Cla/Register"`) to a Rego action identifier.
 #[must_use]
@@ -198,6 +404,32 @@ impl GrpcSecurityGateway {
         internal_storage: Option<InternalStorage>,
         cancel: CancellationToken,
     ) -> anyhow::Result<Option<PathBuf>> {
+        Self::start_with_gate(
+            public_tcp_addr,
+            internal_grpc_addr,
+            auth_cfg,
+            station_callsign,
+            policy_engine,
+            internal_storage,
+            None,
+            cancel,
+        )
+        .await
+    }
+
+    /// Spawns the configured gRPC TCP auth proxy and/or Unix Domain Socket listener
+    /// with an optional [`GrpcRegistrationGate`] guarding the internal loopback server.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_gate(
+        public_tcp_addr: SocketAddr,
+        internal_grpc_addr: SocketAddr,
+        auth_cfg: GrpcAuthConfig,
+        station_callsign: Option<String>,
+        policy_engine: Arc<PolicyEngine>,
+        internal_storage: Option<InternalStorage>,
+        registration_gate: Option<Arc<GrpcRegistrationGate>>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<Option<PathBuf>> {
         let mut active_socket_path: Option<PathBuf> = None;
 
         if auth_cfg.enabled {
@@ -211,6 +443,7 @@ impl GrpcSecurityGateway {
             let callsign_clone = station_callsign.clone();
             let policy_clone = policy_engine.clone();
             let storage_clone = internal_storage.clone();
+            let gate_clone = registration_gate.clone();
             let cancel_clone = cancel.clone();
 
             tokio::spawn(async move {
@@ -225,6 +458,7 @@ impl GrpcSecurityGateway {
                                     let callsign = callsign_clone.clone();
                                     let policy = policy_clone.clone();
                                     let storage = storage_clone.clone();
+                                    let gate = gate_clone.clone();
                                     let peer_ip = peer_addr.ip().to_string();
 
                                     tokio::spawn(async move {
@@ -237,6 +471,7 @@ impl GrpcSecurityGateway {
                                             callsign,
                                             policy,
                                             storage,
+                                            gate,
                                         ).await {
                                             debug!("gRPC TCP gateway connection closed: {e}");
                                         }
@@ -275,6 +510,7 @@ impl GrpcSecurityGateway {
             let callsign_clone = station_callsign;
             let policy_clone = policy_engine;
             let storage_clone = internal_storage;
+            let gate_clone = registration_gate;
             let cancel_clone = cancel;
             let sock_cleanup = sock_path.clone();
 
@@ -292,6 +528,7 @@ impl GrpcSecurityGateway {
                                     let callsign = callsign_clone.clone();
                                     let policy = policy_clone.clone();
                                     let storage = storage_clone.clone();
+                                    let gate = gate_clone.clone();
 
                                     tokio::spawn(async move {
                                         if let Err(e) = handle_h2_gateway_conn(
@@ -303,6 +540,7 @@ impl GrpcSecurityGateway {
                                             callsign,
                                             policy,
                                             storage,
+                                            gate,
                                         ).await {
                                             debug!("gRPC UDS gateway connection closed: {e}");
                                         }
@@ -332,6 +570,7 @@ async fn handle_h2_gateway_conn<IO>(
     station_callsign: Option<String>,
     policy_engine: Arc<PolicyEngine>,
     internal_storage: Option<InternalStorage>,
+    registration_gate: Option<Arc<GrpcRegistrationGate>>,
 ) -> anyhow::Result<()>
 where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -357,11 +596,13 @@ where
         let callsign = station_callsign.clone();
         let policy = policy_engine.clone();
         let storage = internal_storage.clone();
+        let gate = registration_gate.clone();
         let client_ip = client_ip.clone();
 
         async move {
             let path = req.uri().path().to_string();
             let action = map_grpc_path_to_action(&path);
+            let reg_kind = GrpcRegistrationKind::from_grpc_path(&path);
             let user = resolve_grpc_user(&req, is_uds, &auth_cfg.tokens, storage.as_ref());
 
             let auth_mode = if is_uds {
@@ -400,8 +641,16 @@ where
                 ));
             }
 
+            let ticket_id = gate
+                .as_ref()
+                .zip(reg_kind)
+                .and_then(|(g, kind)| g.grant_ticket(kind));
+
             let mut guard = sender_cell.lock().await;
             if let Err(e) = guard.ready().await {
+                if let (Some(g), Some(id)) = (&gate, ticket_id) {
+                    g.revoke_ticket(id);
+                }
                 warn!("gRPC upstream not ready: {e}");
                 return Ok::<_, Infallible>(empty_grpc_error("14", "Upstream BPA unavailable"));
             }
@@ -411,6 +660,9 @@ where
             match fut.await {
                 Ok(resp) => Ok::<_, Infallible>(resp.map(Either::Left)),
                 Err(e) => {
+                    if let (Some(g), Some(id)) = (&gate, ticket_id) {
+                        g.revoke_ticket(id);
+                    }
                     warn!("gRPC upstream request failed: {e}");
                     Ok::<_, Infallible>(empty_grpc_error("14", "Upstream BPA request failed"))
                 }
@@ -620,12 +872,13 @@ mod tests {
     async fn test_grpc_security_gateway_token_and_pbac() {
         let internal_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mock_bpa = Arc::new(crate::mock_bpa::MockBpa::new("dtn://test-node/"));
+        let gate = Arc::new(GrpcRegistrationGate::new());
+        let guarded_bpa = Arc::new(GuardedBpaRegistration::new(mock_bpa.clone(), gate.clone()));
         let grpc_cfg = hardy_proto::server::Config {
             address: internal_addr,
             services: vec!["cla".to_string(), "service".to_string()],
         };
-        let grpc_server =
-            hardy_proto::server::GrpcServer::new(&grpc_cfg, mock_bpa.clone()).unwrap();
+        let grpc_server = hardy_proto::server::GrpcServer::new(&grpc_cfg, guarded_bpa).unwrap();
         let bound_internal = grpc_server.local_addr();
         let cancel = CancellationToken::new();
         let cancel_srv = cancel.clone();
@@ -658,17 +911,35 @@ mod tests {
             ],
         };
 
-        GrpcSecurityGateway::start(
+        GrpcSecurityGateway::start_with_gate(
             public_addr,
             bound_internal,
             auth_cfg,
             Some("TEST".to_string()),
             policy,
             None,
+            Some(gate),
             cancel.clone(),
         )
         .await
         .unwrap();
+
+        // 0. Direct loopback bypass against bound_internal -> REJECTED by GrpcRegistrationGate!
+        let (bypass_bpa, _g0) =
+            create_remote_bpa(&format!("http://{bound_internal}"), None, None).unwrap();
+        let cla0 = Arc::new(crate::NoopSenderCla::default());
+        let res0 = bypass_bpa
+            .register_cla(
+                "bypass-cla".to_string(),
+                cla0,
+                None,
+                hardy_bpa::cla::ClaInit::default(),
+            )
+            .await;
+        assert!(
+            res0.is_err(),
+            "Direct connection bypassing GrpcSecurityGateway MUST be rejected"
+        );
 
         let public_url = format!("http://{public_addr}");
 

@@ -162,7 +162,7 @@ impl RouteManager {
         Ok(true)
     }
 
-    /// Persists the current list of static routes to the YAML configuration file.
+    /// Persists the current list of static routes to the TOML or YAML configuration file.
     async fn persist(&self) {
         let path_opt = self.config_path.read().await.clone();
         let Some(path) = path_opt else {
@@ -170,23 +170,44 @@ impl RouteManager {
         };
 
         let routes = self.routes.read().await.clone();
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return;
+        };
 
-        if let Ok(content) = std::fs::read_to_string(&path)
-            && let Ok(mut doc) = serde_yaml::from_str::<serde_yaml::Value>(&content)
-            && let Ok(routes_val) = serde_yaml::to_value(&routes)
-            && let serde_yaml::Value::Mapping(ref mut map) = doc
+        let is_toml = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
+
+        let updated = if is_toml {
+            if let Ok(mut doc) = toml::from_str::<toml::Value>(&content)
+                && let Ok(routes_val) = toml::Value::try_from(&routes)
+                && let Some(table) = doc.as_table_mut()
+            {
+                table.insert("routes".to_string(), routes_val);
+                toml::to_string_pretty(&doc).ok()
+            } else {
+                None
+            }
+        } else if let Ok(mut doc) = yaml_serde::from_str::<yaml_serde::Value>(&content)
+            && let Ok(routes_val) = yaml_serde::to_value(&routes)
+            && let yaml_serde::Value::Mapping(ref mut map) = doc
         {
-            map.insert(serde_yaml::Value::String("routes".to_string()), routes_val);
-            if let Ok(new_yaml) = serde_yaml::to_string(&doc) {
-                if let Err(e) = std::fs::write(&path, new_yaml) {
-                    warn!("Failed to persist routes to {}: {e}", path.display());
-                } else {
-                    info!(
-                        "Persisted {} static route(s) to configuration {}",
-                        routes.len(),
-                        path.display()
-                    );
-                }
+            map.insert(yaml_serde::Value::String("routes".to_string()), routes_val);
+            yaml_serde::to_string(&doc).ok()
+        } else {
+            None
+        };
+
+        if let Some(new_content) = updated {
+            if let Err(e) = std::fs::write(&path, new_content) {
+                warn!("Failed to persist routes to {}: {e}", path.display());
+            } else {
+                info!(
+                    "Persisted {} static route(s) to configuration {}",
+                    routes.len(),
+                    path.display()
+                );
             }
         }
     }

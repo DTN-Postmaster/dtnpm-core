@@ -764,7 +764,7 @@ application:
   quota:
     max-storage: "500MB"
 "#;
-        let cfg: HamConfig = serde_yaml::from_str(yaml_str).unwrap();
+        let cfg: HamConfig = yaml_serde::from_str(yaml_str).unwrap();
         assert_eq!(cfg.application.quota.max_storage, 500 * 1024 * 1024);
 
         // 2. With numeric value
@@ -773,12 +773,12 @@ application:
   quota:
     max-storage: 10485760
 "#;
-        let cfg_num: HamConfig = serde_yaml::from_str(yaml_num).unwrap();
+        let cfg_num: HamConfig = yaml_serde::from_str(yaml_num).unwrap();
         assert_eq!(cfg_num.application.quota.max_storage, 10485760);
 
         // 3. Omitted (default 300MB)
         let yaml_default = "node-id: 'dtn://test/'";
-        let cfg_default: HamConfig = serde_yaml::from_str(yaml_default).unwrap();
+        let cfg_default: HamConfig = yaml_serde::from_str(yaml_default).unwrap();
         assert_eq!(
             cfg_default.application.quota.max_storage,
             DEFAULT_APP_MAX_STORAGE_BYTES
@@ -804,7 +804,7 @@ clas:
     type: mercury-arq
     my-callsign: "F4KLO"
 "#;
-        let cfg_yaml: HamConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg_yaml: HamConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(cfg_yaml.clas.len(), 4);
         assert_eq!(cfg_yaml.clas[0].cla_type.type_name(), "ltp");
         assert_eq!(cfg_yaml.clas[1].cla_type.type_name(), "hqfbp");
