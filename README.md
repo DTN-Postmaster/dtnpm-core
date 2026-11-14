@@ -29,6 +29,13 @@ Requires sibling checkouts of `../../hardy/*` as referenced in `Cargo.toml`.
 cargo test
 ```
 
+## Security & Compliance
+
+- **Cyber Resilience Act (CRA)**: Strict dependency audits via `cargo-audit` / `cargo-deny` with documented VEX rationale (`RUSTSEC-2026-0459`), `yaml_serde` (libyaml-free), and SHA-pinned CI actions.
+- **OWASP / Access Control**: Protected gRPC registration barrier (`GrpcRegistrationGate`), PBAC Rego policy enforcement, and Bearer token resolution via `--token-file`.
+- **Rust Quality Standards**: 100% `unwrap`-free and `panic!`-free production codebase.
+- **Documentation**: See [`AGENTS.md`](AGENTS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and Architectural Decision Records in [`adr/`](adr/).
+
 ## License
 
 Dual-licensed under the Apache License, Version 2.0 or the MIT License. See [LICENSE.md](LICENSE.md).
