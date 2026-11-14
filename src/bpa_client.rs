@@ -105,15 +105,45 @@ impl BpaClient for LocalBpaClient {
 pub struct GrpcBpaClient {
     endpoint: String,
     remote: hardy_proto::client::RemoteBpa,
+    _bridge_guard: Option<crate::iam::grpc_guard::GrpcBridgeGuard>,
 }
 
 #[cfg(feature = "transport-grpc")]
 impl GrpcBpaClient {
-    /// Creates a new gRPC BPA client targeting `grpc_addr` (e.g. `"http://127.0.0.1:50051"`).
+    /// Creates a new gRPC BPA client targeting `grpc_addr` (e.g. `"http://127.0.0.1:50051"`),
+    /// automatically honoring `DTN_HDY_TOKEN` and `DTN_HDY_SOCKET` if set.
     pub fn new(grpc_addr: impl Into<String>) -> Self {
-        let endpoint = grpc_addr.into();
-        let remote = hardy_proto::client::RemoteBpa::new(endpoint.clone());
-        Self { endpoint, remote }
+        Self::with_auth(grpc_addr, None, None)
+    }
+
+    /// Creates a new gRPC BPA client with explicit optional Bearer token and Unix socket path.
+    pub fn with_auth(
+        grpc_addr: impl Into<String>,
+        token: Option<&str>,
+        socket_path: Option<&str>,
+    ) -> Self {
+        let raw = grpc_addr.into();
+        match crate::iam::grpc_guard::prepare_grpc_endpoint(&raw, token, socket_path) {
+            Ok((effective_endpoint, guard)) => {
+                let remote = hardy_proto::client::RemoteBpa::new(effective_endpoint.clone());
+                Self {
+                    endpoint: raw,
+                    remote,
+                    _bridge_guard: guard,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to prepare authenticated gRPC bridge for {raw}: {e}; using direct endpoint"
+                );
+                let remote = hardy_proto::client::RemoteBpa::new(raw.clone());
+                Self {
+                    endpoint: raw,
+                    remote,
+                    _bridge_guard: None,
+                }
+            }
+        }
     }
 
     /// Returns the configured gRPC endpoint string.

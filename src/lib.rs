@@ -11,6 +11,7 @@ pub mod cla_manager;
 pub mod cli_security;
 pub mod config;
 pub mod coordinator;
+pub mod iam;
 pub mod internal_storage;
 pub mod log_buffer;
 pub mod mock_bpa;
@@ -23,7 +24,11 @@ pub mod service_tracker;
 pub use bpa_client::GrpcBpaClient;
 pub use bpa_client::{BpaClient, LocalBpaClient};
 pub use config::HamConfig;
-pub use internal_storage::{FileBundleRecord, InternalStorage};
+#[cfg(feature = "transport-grpc")]
+pub use iam::grpc_guard::create_remote_bpa;
+pub use internal_storage::{
+    FileBundleRecord, IamApiTokenRecord, IamSessionRecord, IamUserRecord, InternalStorage,
+};
 pub use log_buffer::{LogBuffer, LogBufferLayer, LogEntry};
 pub use mock_bpa::{CapturedBundle, MockBpa};
 pub use pacing::LeakyBucket;

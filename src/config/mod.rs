@@ -57,6 +57,14 @@ pub struct HamConfig {
     #[serde(default)]
     pub rfc9171_validity: Option<Rfc9171ValidityConfig>,
 
+    /// Identity, authentication, and Policy-Based Access Control (PBAC) configuration.
+    #[serde(default)]
+    pub auth: AuthConfig,
+
+    /// Optional native TLS configuration for the HTTP/REST server.
+    #[serde(default)]
+    pub tls: TlsConfig,
+
     /// Optional filesystem path this configuration was loaded from.
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
@@ -76,6 +84,8 @@ impl Default for HamConfig {
             routes: Vec::new(),
             senml: None,
             rfc9171_validity: Some(Rfc9171ValidityConfig::default()),
+            auth: AuthConfig::default(),
+            tls: TlsConfig::default(),
             config_path: None,
         }
     }
@@ -277,6 +287,10 @@ pub struct GrpcConfig {
 
     /// Local address to bind the gRPC server.
     pub address: SocketAddr,
+
+    /// Authentication and Unix Domain Socket settings for the gRPC server.
+    #[serde(default)]
+    pub auth: GrpcAuthConfig,
 }
 
 impl Default for GrpcConfig {
@@ -284,8 +298,209 @@ impl Default for GrpcConfig {
         Self {
             enabled: true,
             address: default_grpc_addr(),
+            auth: GrpcAuthConfig::default(),
         }
     }
+}
+
+/// Authentication operating mode for HTTP/Web access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    /// No authentication (open local station dashboard, default for backward compatibility).
+    #[default]
+    None,
+    /// Delegate authentication to a trusted reverse proxy (SSOwat, Authelia, Authentik, Nginx).
+    Proxy,
+    /// Built-in local authentication using Argon2id users, HttpOnly sessions, and Bearer API tokens.
+    Local,
+}
+
+impl AuthMode {
+    /// Returns the lowercase canonical string representation (`"none"`, `"proxy"`, `"local"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Proxy => "proxy",
+            Self::Local => "local",
+        }
+    }
+}
+
+fn default_proxy_header_user() -> String {
+    "Remote-User".to_string()
+}
+
+fn default_proxy_header_groups() -> String {
+    "Remote-Groups".to_string()
+}
+
+fn default_trusted_proxies() -> Vec<String> {
+    vec!["127.0.0.1/32".to_string(), "::1/128".to_string()]
+}
+
+/// Reverse-proxy SSO header configuration (`[auth.proxy]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ProxyAuthConfig {
+    /// Header carrying the authenticated username (e.g. `Remote-User`).
+    #[serde(default = "default_proxy_header_user", alias = "header_user")]
+    pub header_user: String,
+
+    /// Header carrying comma-separated user groups (e.g. `Remote-Groups`).
+    #[serde(default = "default_proxy_header_groups", alias = "header_groups")]
+    pub header_groups: String,
+
+    /// CIDR list of trusted reverse proxies allowed to supply identity headers.
+    #[serde(default = "default_trusted_proxies", alias = "trusted_proxies")]
+    pub trusted_proxies: Vec<String>,
+}
+
+impl Default for ProxyAuthConfig {
+    fn default() -> Self {
+        Self {
+            header_user: default_proxy_header_user(),
+            header_groups: default_proxy_header_groups(),
+            trusted_proxies: default_trusted_proxies(),
+        }
+    }
+}
+
+fn default_admin_groups() -> Vec<String> {
+    vec!["admins".to_string(), "dtn_admins".to_string()]
+}
+
+fn default_session_ttl() -> String {
+    "24h".to_string()
+}
+
+/// Parses a human-readable duration string (e.g. `"24h"`, `"30m"`, `"3600s"`, or raw seconds).
+#[must_use]
+pub fn parse_duration_secs(s: &str) -> u64 {
+    let trimmed = s.trim();
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return secs.max(1);
+    }
+    humantime::parse_duration(trimmed)
+        .map(|d| d.as_secs().max(1))
+        .unwrap_or(86_400)
+}
+
+/// Root IAM and PBAC configuration (`[auth]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct AuthConfig {
+    /// Authentication mode (`none`, `proxy`, or `local`).
+    pub mode: AuthMode,
+
+    /// Explicit usernames mapped to the `Admin` role (primarily for `proxy` mode).
+    #[serde(default, alias = "admin_users")]
+    pub admin_users: Vec<String>,
+
+    /// Explicit groups mapped to the `Admin` role (in `proxy` mode).
+    #[serde(default = "default_admin_groups", alias = "admin_groups")]
+    pub admin_groups: Vec<String>,
+
+    /// Optional path to an external OPA Rego policy file overriding the embedded policy.
+    #[serde(default, alias = "policy_path")]
+    pub policy_path: Option<PathBuf>,
+
+    /// Session time-to-live for `local` authentication cookies (e.g. `"24h"`).
+    #[serde(default = "default_session_ttl", alias = "session_ttl")]
+    pub session_ttl: String,
+
+    /// Reverse-proxy SSO parameters when `mode = "proxy"`.
+    #[serde(default)]
+    pub proxy: ProxyAuthConfig,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: AuthMode::None,
+            admin_users: Vec::new(),
+            admin_groups: default_admin_groups(),
+            policy_path: None,
+            session_ttl: default_session_ttl(),
+            proxy: ProxyAuthConfig::default(),
+        }
+    }
+}
+
+fn default_operator_role() -> String {
+    "Operator".to_string()
+}
+
+/// Static pre-shared API/gRPC token entry (`[[grpc.auth.tokens]]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct GrpcTokenEntry {
+    /// Human-readable service identifier (e.g. `"ltp-kiss-daemon"`).
+    pub name: String,
+
+    /// Secret Bearer token value.
+    pub token: String,
+
+    /// Role assigned to this token (`Admin` or `Operator`).
+    #[serde(default = "default_operator_role")]
+    pub role: String,
+}
+
+fn default_socket_mode() -> String {
+    "0660".to_string()
+}
+
+/// Authentication and Unix Domain Socket settings for gRPC (`[grpc.auth]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct GrpcAuthConfig {
+    /// Require Bearer token authentication on TCP gRPC connections.
+    pub enabled: bool,
+
+    /// Optional Unix Domain Socket path for local daemon-to-daemon gRPC access.
+    #[serde(default, alias = "socket_path")]
+    pub socket_path: Option<PathBuf>,
+
+    /// Optional system group name for the Unix Domain Socket.
+    #[serde(default, alias = "socket_group")]
+    pub socket_group: Option<String>,
+
+    /// Octal permissions mode string for the Unix Domain Socket (default `"0660"`).
+    #[serde(default = "default_socket_mode", alias = "socket_mode")]
+    pub socket_mode: String,
+
+    /// Statically configured Bearer tokens for gRPC services/CLAs.
+    #[serde(default)]
+    pub tokens: Vec<GrpcTokenEntry>,
+}
+
+impl Default for GrpcAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            socket_path: None,
+            socket_group: None,
+            socket_mode: default_socket_mode(),
+            tokens: Vec::new(),
+        }
+    }
+}
+
+/// Optional native TLS configuration (`[tls]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct TlsConfig {
+    /// Enable TLS termination directly in the embedded Axum web server.
+    pub enabled: bool,
+
+    /// Path to PEM-encoded certificate chain.
+    #[serde(default, alias = "cert_path")]
+    pub cert_path: Option<PathBuf>,
+
+    /// Path to PEM-encoded private key.
+    #[serde(default, alias = "key_path")]
+    pub key_path: Option<PathBuf>,
 }
 
 fn default_web_addr() -> SocketAddr {
@@ -646,5 +861,73 @@ bitrate = 2400
             let abs = base.home_dir().join("test.yaml");
             assert_eq!(contract_tilde(&abs), "~/test.yaml");
         }
+    }
+
+    #[test]
+    fn test_iam_and_tls_toml_config_parsing() {
+        let toml_str = r#"
+callsign = "F4KLO"
+
+[auth]
+mode = "proxy"
+admin_users = ["f4klo"]
+admin_groups = ["dtn_admins", "admins"]
+policy_path = "/etc/dtnpm/policy.rego"
+session_ttl = "12h"
+
+[auth.proxy]
+header_user = "Remote-User"
+header_groups = "Remote-Groups"
+trusted_proxies = ["127.0.0.1/32", "10.0.0.0/8"]
+
+[grpc]
+enabled = true
+address = "127.0.0.1:50051"
+
+[grpc.auth]
+enabled = true
+socket_path = "/run/dtnpm/dtnpm.sock"
+socket_group = "dtnpm"
+socket_mode = "0660"
+
+[[grpc.auth.tokens]]
+name = "ltp-kiss-daemon"
+token = "tok-123"
+role = "Admin"
+
+[tls]
+enabled = true
+cert_path = "/etc/dtnpm/cert.pem"
+key_path = "/etc/dtnpm/key.pem"
+"#;
+
+        let cfg = config::Config::builder()
+            .add_source(config::File::from_str(toml_str, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize::<HamConfig>()
+            .unwrap();
+
+        assert_eq!(cfg.auth.mode, AuthMode::Proxy);
+        assert_eq!(cfg.auth.admin_users, vec!["f4klo"]);
+        assert_eq!(cfg.auth.admin_groups, vec!["dtn_admins", "admins"]);
+        assert_eq!(
+            cfg.auth.policy_path.as_deref(),
+            Some(Path::new("/etc/dtnpm/policy.rego"))
+        );
+        assert_eq!(parse_duration_secs(&cfg.auth.session_ttl), 12 * 3600);
+        assert_eq!(cfg.auth.proxy.header_user, "Remote-User");
+        assert_eq!(
+            cfg.auth.proxy.trusted_proxies,
+            vec!["127.0.0.1/32", "10.0.0.0/8"]
+        );
+        assert!(cfg.grpc.auth.enabled);
+        assert_eq!(
+            cfg.grpc.auth.socket_path.as_deref(),
+            Some(Path::new("/run/dtnpm/dtnpm.sock"))
+        );
+        assert_eq!(cfg.grpc.auth.tokens.len(), 1);
+        assert_eq!(cfg.grpc.auth.tokens[0].role, "Admin");
+        assert!(cfg.tls.enabled);
     }
 }

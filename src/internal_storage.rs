@@ -8,9 +8,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use argon2::password_hash::SaltString;
+use argon2::password_hash::rand_core::OsRng as ArgonOsRng;
+use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version};
 use hardy_async::CancellationToken;
+use rand::RngCore;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use tracing::{debug, error, info, warn};
 
@@ -107,6 +113,38 @@ pub struct FileBundleRecord {
     /// Cryptographic authentication status: "valid" | "invalid" | "missing_key" | "unsigned"
     #[serde(default = "default_auth_status")]
     pub auth_status: String,
+}
+
+/// Registered local operator/administrator account stored in `iam_users`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IamUserRecord {
+    pub username: String,
+    pub role: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Active web authentication session stored in `iam_sessions`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IamSessionRecord {
+    pub session_id: String,
+    pub username: String,
+    pub role: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub last_seen_at: i64,
+    pub user_agent: Option<String>,
+    pub client_ip: Option<String>,
+}
+
+/// API / gRPC Bearer token metadata stored in `iam_api_tokens` (without raw secret).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IamApiTokenRecord {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
 }
 
 /// Normalizes any peer string into canonical node EID.
@@ -513,6 +551,36 @@ impl InternalStorage {
 
             CREATE INDEX IF NOT EXISTS idx_files_created ON files_bundles(creation_timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_files_expiry ON files_bundles(is_sticky, expiry_timestamp);
+
+            CREATE TABLE IF NOT EXISTS iam_users (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('Admin', 'Operator')),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS iam_sessions (
+                session_id TEXT PRIMARY KEY,
+                username TEXT NOT NULL REFERENCES iam_users(username) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                user_agent TEXT,
+                client_ip TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_iam_sessions_expires ON iam_sessions(expires_at);
+
+            CREATE TABLE IF NOT EXISTS iam_api_tokens (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                token_hash TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('Admin', 'Operator')),
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER
+            );
             "#,
         )?;
 
@@ -1154,6 +1222,435 @@ impl InternalStorage {
 
         Ok(total)
     }
+
+    // =========================================================================
+    // IAM Users, Sessions, and API Tokens
+    // =========================================================================
+
+    /// Normalizes a role label (case-insensitive) to `"Admin"` or `"Operator"`.
+    pub fn normalize_iam_role(role: &str) -> anyhow::Result<&'static str> {
+        match role.trim().to_ascii_lowercase().as_str() {
+            "admin" => Ok("Admin"),
+            "operator" => Ok("Operator"),
+            other => anyhow::bail!("Invalid IAM role '{other}': expected Admin or Operator"),
+        }
+    }
+
+    fn argon2_hasher() -> Argon2<'static> {
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default())
+    }
+
+    fn hash_password(password: &str) -> anyhow::Result<String> {
+        if password.is_empty() {
+            anyhow::bail!("Password cannot be empty");
+        }
+        let salt = SaltString::generate(&mut ArgonOsRng);
+        let hash = Self::argon2_hasher()
+            .hash_password(password.as_bytes(), &salt)
+            .map_err(|e| anyhow::anyhow!("Argon2id password hashing failed: {e}"))?
+            .to_string();
+        Ok(hash)
+    }
+
+    fn generate_random_hex_token(byte_len: usize) -> String {
+        let mut buf = vec![0u8; byte_len];
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        hex::encode(buf)
+    }
+
+    fn dummy_argon2_hash() -> &'static str {
+        static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        DUMMY.get_or_init(|| {
+            Self::hash_password("dtnpm-dummy-timing-equalizer-secret")
+                .unwrap_or_else(|_| String::new())
+        })
+    }
+
+    /// Creates a new local IAM user or updates an existing user's password and role.
+    pub fn upsert_iam_user(
+        &self,
+        username: &str,
+        password: &str,
+        role: &str,
+    ) -> anyhow::Result<IamUserRecord> {
+        let username = username.trim();
+        if username.is_empty() {
+            anyhow::bail!("Username cannot be empty");
+        }
+        let canonical_role = Self::normalize_iam_role(role)?;
+        let password_hash = Self::hash_password(password)?;
+        let now_secs = OffsetDateTime::now_utc().unix_timestamp();
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+
+        conn.execute(
+            r#"
+            INSERT INTO iam_users (username, password_hash, role, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?4)
+            ON CONFLICT(username) DO UPDATE SET
+                password_hash = excluded.password_hash,
+                role = excluded.role,
+                updated_at = excluded.updated_at
+            "#,
+            params![username, password_hash, canonical_role, now_secs],
+        )?;
+
+        let record = conn.query_row(
+            "SELECT username, role, created_at, updated_at FROM iam_users WHERE username = ?1",
+            params![username],
+            |r| {
+                Ok(IamUserRecord {
+                    username: r.get(0)?,
+                    role: r.get(1)?,
+                    created_at: r.get(2)?,
+                    updated_at: r.get(3)?,
+                })
+            },
+        )?;
+        Ok(record)
+    }
+
+    /// Updates an existing user's password and invalidates all active sessions for that user.
+    pub fn update_iam_user_password(
+        &self,
+        username: &str,
+        new_password: &str,
+    ) -> anyhow::Result<bool> {
+        let username = username.trim();
+        let password_hash = Self::hash_password(new_password)?;
+        let now_secs = OffsetDateTime::now_utc().unix_timestamp();
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+
+        let updated = conn.execute(
+            "UPDATE iam_users SET password_hash = ?1, updated_at = ?2 WHERE username = ?3",
+            params![password_hash, now_secs, username],
+        )?;
+        if updated > 0 {
+            let _ = conn.execute(
+                "DELETE FROM iam_sessions WHERE username = ?1",
+                params![username],
+            );
+        }
+        Ok(updated > 0)
+    }
+
+    /// Lists all configured IAM users without exposing password hashes.
+    pub fn list_iam_users(&self) -> anyhow::Result<Vec<IamUserRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT username, role, created_at, updated_at FROM iam_users ORDER BY username ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(IamUserRecord {
+                username: r.get(0)?,
+                role: r.get(1)?,
+                created_at: r.get(2)?,
+                updated_at: r.get(3)?,
+            })
+        })?;
+        let mut users = Vec::new();
+        for row in rows {
+            users.push(row?);
+        }
+        Ok(users)
+    }
+
+    /// Verifies username and password in Argon2id (equalizing timing on missing usernames).
+    pub fn verify_iam_user_password(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> anyhow::Result<Option<IamUserRecord>> {
+        let username = username.trim();
+        let fetched: Option<(IamUserRecord, String)> = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+            let mut stmt = conn.prepare(
+                "SELECT username, role, created_at, updated_at, password_hash FROM iam_users WHERE username = ?1",
+            )?;
+            let mut rows = stmt.query_map(params![username], |r| {
+                Ok((
+                    IamUserRecord {
+                        username: r.get(0)?,
+                        role: r.get(1)?,
+                        created_at: r.get(2)?,
+                        updated_at: r.get(3)?,
+                    },
+                    r.get::<_, String>(4)?,
+                ))
+            })?;
+            match rows.next() {
+                Some(row) => Some(row?),
+                None => None,
+            }
+        };
+
+        let (user, stored_hash, user_found) = match fetched {
+            Some((u, h)) => (Some(u), h, true),
+            None => (None, Self::dummy_argon2_hash().to_string(), false),
+        };
+
+        if let Ok(parsed_hash) = PasswordHash::new(&stored_hash) {
+            let valid = Self::argon2_hasher()
+                .verify_password(password.as_bytes(), &parsed_hash)
+                .is_ok();
+            if valid && user_found {
+                return Ok(user);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Creates a new CSPRNG-backed opaque session token stored in SQLite.
+    pub fn create_iam_session(
+        &self,
+        username: &str,
+        role: &str,
+        ttl_secs: u64,
+        user_agent: Option<&str>,
+        client_ip: Option<&str>,
+    ) -> anyhow::Result<IamSessionRecord> {
+        let canonical_role = Self::normalize_iam_role(role)?;
+        let session_id = Self::generate_random_hex_token(32);
+        let now_secs = OffsetDateTime::now_utc().unix_timestamp();
+        let expires_at = now_secs.saturating_add(ttl_secs.min(i64::MAX as u64) as i64);
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+        let _ = conn.execute(
+            "DELETE FROM iam_sessions WHERE expires_at <= ?1",
+            params![now_secs],
+        );
+        conn.execute(
+            r#"
+            INSERT INTO iam_sessions (session_id, username, role, created_at, expires_at, last_seen_at, user_agent, client_ip)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?6, ?7)
+            "#,
+            params![
+                session_id,
+                username,
+                canonical_role,
+                now_secs,
+                expires_at,
+                user_agent,
+                client_ip
+            ],
+        )?;
+
+        Ok(IamSessionRecord {
+            session_id,
+            username: username.to_string(),
+            role: canonical_role.to_string(),
+            created_at: now_secs,
+            expires_at,
+            last_seen_at: now_secs,
+            user_agent: user_agent.map(str::to_string),
+            client_ip: client_ip.map(str::to_string),
+        })
+    }
+
+    /// Looks up a valid, unexpired session and updates `last_seen_at`.
+    pub fn get_valid_iam_session(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<IamSessionRecord>> {
+        let now_secs = OffsetDateTime::now_utc().unix_timestamp();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+        let _ = conn.execute(
+            "DELETE FROM iam_sessions WHERE expires_at <= ?1",
+            params![now_secs],
+        );
+
+        let mut stmt = conn.prepare(
+            "SELECT session_id, username, role, created_at, expires_at, last_seen_at, user_agent, client_ip FROM iam_sessions WHERE session_id = ?1 AND expires_at > ?2",
+        )?;
+        let mut rows = stmt.query_map(params![session_id, now_secs], |r| {
+            Ok(IamSessionRecord {
+                session_id: r.get(0)?,
+                username: r.get(1)?,
+                role: r.get(2)?,
+                created_at: r.get(3)?,
+                expires_at: r.get(4)?,
+                last_seen_at: r.get(5)?,
+                user_agent: r.get(6)?,
+                client_ip: r.get(7)?,
+            })
+        })?;
+        let Some(row) = rows.next() else {
+            return Ok(None);
+        };
+        let mut session = row?;
+        drop(rows);
+        drop(stmt);
+
+        let _ = conn.execute(
+            "UPDATE iam_sessions SET last_seen_at = ?1 WHERE session_id = ?2",
+            params![now_secs, session.session_id],
+        );
+        session.last_seen_at = now_secs;
+        Ok(Some(session))
+    }
+
+    /// Deletes a session on explicit logout.
+    pub fn delete_iam_session(&self, session_id: &str) -> anyhow::Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+        let affected = conn.execute(
+            "DELETE FROM iam_sessions WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Creates a new API / gRPC Bearer token and returns `(raw_token, record)`.
+    /// Only the SHA-256 hash of `raw_token` is persisted in SQLite.
+    pub fn create_iam_api_token(
+        &self,
+        name: &str,
+        role: &str,
+    ) -> anyhow::Result<(String, IamApiTokenRecord)> {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("Token name cannot be empty");
+        }
+        let canonical_role = Self::normalize_iam_role(role)?;
+        let id = Self::generate_random_hex_token(8);
+        let raw_token = format!("dtnpm_{}", Self::generate_random_hex_token(32));
+        let token_hash = hex::encode(Sha256::digest(raw_token.as_bytes()));
+        let now_secs = OffsetDateTime::now_utc().unix_timestamp();
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+        conn.execute(
+            r#"
+            INSERT INTO iam_api_tokens (id, name, token_hash, role, created_at, last_used_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, NULL)
+            "#,
+            params![id, name, token_hash, canonical_role, now_secs],
+        )?;
+
+        Ok((
+            raw_token,
+            IamApiTokenRecord {
+                id,
+                name: name.to_string(),
+                role: canonical_role.to_string(),
+                created_at: now_secs,
+                last_used_at: None,
+            },
+        ))
+    }
+
+    /// Lists all configured API tokens without exposing hashes.
+    pub fn list_iam_api_tokens(&self) -> anyhow::Result<Vec<IamApiTokenRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, role, created_at, last_used_at FROM iam_api_tokens ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(IamApiTokenRecord {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                role: r.get(2)?,
+                created_at: r.get(3)?,
+                last_used_at: r.get(4)?,
+            })
+        })?;
+        let mut tokens = Vec::new();
+        for row in rows {
+            tokens.push(row?);
+        }
+        Ok(tokens)
+    }
+
+    /// Revokes an API token by ID or unique name.
+    pub fn revoke_iam_api_token(&self, id_or_name: &str) -> anyhow::Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+        let affected = conn.execute(
+            "DELETE FROM iam_api_tokens WHERE id = ?1 OR name = ?1",
+            params![id_or_name.trim()],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Verifies a raw Bearer token against stored SHA-256 hashes in constant time.
+    pub fn verify_iam_api_token(
+        &self,
+        raw_token: &str,
+    ) -> anyhow::Result<Option<IamApiTokenRecord>> {
+        let candidate_hash = hex::encode(Sha256::digest(raw_token.as_bytes()));
+        let candidate_bytes = candidate_hash.as_bytes();
+        let now_secs = OffsetDateTime::now_utc().unix_timestamp();
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, role, created_at, last_used_at, token_hash FROM iam_api_tokens",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                IamApiTokenRecord {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    role: r.get(2)?,
+                    created_at: r.get(3)?,
+                    last_used_at: r.get(4)?,
+                },
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+
+        let mut matched: Option<IamApiTokenRecord> = None;
+        for row in rows {
+            let (record, stored_hash) = row?;
+            let is_eq = stored_hash.len() == candidate_bytes.len()
+                && bool::from(stored_hash.as_bytes().ct_eq(candidate_bytes));
+            if is_eq {
+                matched = Some(record);
+            }
+        }
+        drop(stmt);
+
+        if let Some(mut rec) = matched {
+            let _ = conn.execute(
+                "UPDATE iam_api_tokens SET last_used_at = ?1 WHERE id = ?2",
+                params![now_secs, rec.id],
+            );
+            rec.last_used_at = Some(now_secs);
+            return Ok(Some(rec));
+        }
+
+        Ok(None)
+    }
 }
 
 /// Spawns the background expiration reaper task that sleeps until the next earliest deadline.
@@ -1758,5 +2255,112 @@ mod tests {
             res.is_err(),
             "Must reject incoming bundle when all remaining items are sticky"
         );
+    }
+
+    #[test]
+    fn test_iam_users_sessions_and_tokens() {
+        let storage = InternalStorage::new_in_memory().unwrap();
+
+        // 1. Create and list users
+        let u1 = storage
+            .upsert_iam_user("f4jxq", "SecretRadio!42", "admin")
+            .unwrap();
+        assert_eq!(u1.username, "f4jxq");
+        assert_eq!(u1.role, "Admin");
+
+        let u2 = storage
+            .upsert_iam_user("f4abc", "OperatorPass!1", "Operator")
+            .unwrap();
+        assert_eq!(u2.role, "Operator");
+
+        let users = storage.list_iam_users().unwrap();
+        assert_eq!(users.len(), 2);
+
+        // Invalid role fails cleanly
+        assert!(storage.upsert_iam_user("bad", "pass", "Superuser").is_err());
+
+        // 2. Password verification (valid, wrong password, unknown user)
+        assert_eq!(
+            storage
+                .verify_iam_user_password("f4jxq", "SecretRadio!42")
+                .unwrap()
+                .unwrap()
+                .username,
+            "f4jxq"
+        );
+        assert!(
+            storage
+                .verify_iam_user_password("f4jxq", "WrongPassword")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .verify_iam_user_password("unknown_callsign", "SecretRadio!42")
+                .unwrap()
+                .is_none()
+        );
+
+        // 3. Sessions + password change invalidation + logout
+        let sess = storage
+            .create_iam_session("f4jxq", "Admin", 3600, Some("TestUA"), Some("127.0.0.1"))
+            .unwrap();
+        assert_eq!(sess.session_id.len(), 64);
+        assert!(
+            storage
+                .get_valid_iam_session(&sess.session_id)
+                .unwrap()
+                .is_some()
+        );
+
+        // Updating password must invalidate active sessions
+        assert!(
+            storage
+                .update_iam_user_password("f4jxq", "NewSecret!99")
+                .unwrap()
+        );
+        assert!(
+            storage
+                .get_valid_iam_session(&sess.session_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .verify_iam_user_password("f4jxq", "NewSecret!99")
+                .unwrap()
+                .is_some()
+        );
+
+        // Explicit session delete
+        let sess2 = storage
+            .create_iam_session("f4abc", "Operator", 3600, None, None)
+            .unwrap();
+        assert!(storage.delete_iam_session(&sess2.session_id).unwrap());
+        assert!(
+            storage
+                .get_valid_iam_session(&sess2.session_id)
+                .unwrap()
+                .is_none()
+        );
+
+        // 4. API tokens create, constant-time verify, list, revoke
+        let (raw_tok, tok_rec) = storage
+            .create_iam_api_token("ltp-kiss", "Operator")
+            .unwrap();
+        assert!(raw_tok.starts_with("dtnpm_"));
+        assert_eq!(storage.list_iam_api_tokens().unwrap().len(), 1);
+        assert_eq!(
+            storage.verify_iam_api_token(&raw_tok).unwrap().unwrap().id,
+            tok_rec.id
+        );
+        assert!(
+            storage
+                .verify_iam_api_token("dtnpm_invalidtoken")
+                .unwrap()
+                .is_none()
+        );
+        assert!(storage.revoke_iam_api_token(&tok_rec.id).unwrap());
+        assert!(storage.verify_iam_api_token(&raw_tok).unwrap().is_none());
     }
 }
