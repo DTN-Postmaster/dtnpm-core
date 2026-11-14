@@ -95,7 +95,10 @@ impl Serialize for ClaType {
                 m
             }
         };
-        map.insert("type".to_string(), serde_json::Value::String(tag.to_string()));
+        map.insert(
+            "type".to_string(),
+            serde_json::Value::String(tag.to_string()),
+        );
         map.serialize(serializer)
     }
 }

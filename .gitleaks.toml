@@ -1,0 +1,28 @@
+title = "Gitleaks configuration for dtnpm-core"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allowlisted test fixtures, lockfiles, and build outputs"
+paths = [
+    '''Cargo\.lock''',
+    '''sbom\.json''',
+    '''target/.*''',
+    '''tests/.*''',
+    '''examples/.*''',
+]
+regexes = [
+    '''hdy_sec_9f823a\.\.\.''',
+]
+stopwords = [
+    "test_",
+    "example",
+    "dummy",
+    "mock",
+    "N0CALL",
+    "F4JXQ",
+    "STATA",
+    "STATB",
+    "changeme",
+]

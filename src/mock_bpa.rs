@@ -11,8 +11,8 @@ use hardy_bpa::services::{
     self, Application, ApplicationSink, SendOptions, Service, ServiceSink, StatusNotify,
 };
 use hardy_bpa::stream::{Receiver, Segment, concat_stream};
-use hardy_bpv7::bundle::Id;
 use hardy_bpv7::builder::Builder;
+use hardy_bpv7::bundle::Id;
 use hardy_bpv7::creation_timestamp::CreationTimestamp;
 use hardy_bpv7::eid::{DtnNodeId, Eid, IpnNodeId, NodeId, Service as ServiceId};
 use hardy_bpv7::status_report::ReasonCode;
@@ -154,7 +154,7 @@ impl MockBpa {
         let (ipn, dtn) = match parsed {
             NodeId::Ipn(ipn) => (Some(ipn), None),
             NodeId::Dtn(dtn) => (None, Some(dtn)),
-            NodeId::LocalNode => panic!("LocalNode is not valid for MockBpa::new"),
+            NodeId::LocalNode => (None, None),
         };
         Self {
             inner: Arc::new(MockBpaInner {
@@ -171,13 +171,13 @@ impl MockBpa {
 
     /// Creates a `MockBpa` with both a DTN node ID and an IPN node ID.
     pub fn with_node_ids(dtn: Option<&str>, ipn: Option<&str>) -> Self {
-        let dtn = dtn.map(|s| match s.parse::<NodeId>().expect("valid dtn NodeId") {
-            NodeId::Dtn(n) => n,
-            _ => panic!("expected dtn NodeId"),
+        let dtn = dtn.and_then(|s| match s.parse::<NodeId>().ok()? {
+            NodeId::Dtn(n) => Some(n),
+            _ => None,
         });
-        let ipn = ipn.map(|s| match s.parse::<NodeId>().expect("valid ipn NodeId") {
-            NodeId::Ipn(n) => n,
-            _ => panic!("expected ipn NodeId"),
+        let ipn = ipn.and_then(|s| match s.parse::<NodeId>().ok()? {
+            NodeId::Ipn(n) => Some(n),
+            _ => None,
         });
         Self {
             inner: Arc::new(MockBpaInner {
@@ -422,9 +422,9 @@ impl RoutingSink for MockRoutingSink {
         priority: u32,
     ) -> routing::Result<bool> {
         let mut routes = self.inner.routes.write().unwrap_or_else(|e| e.into_inner());
-        let exists = routes
-            .iter()
-            .any(|(s, p, a, pr)| s == &self.name && p == &pattern && a == &action && *pr == priority);
+        let exists = routes.iter().any(|(s, p, a, pr)| {
+            s == &self.name && p == &pattern && a == &action && *pr == priority
+        });
         if exists {
             return Ok(false);
         }
@@ -499,7 +499,10 @@ impl BpaRegistration for MockBpa {
             .targets
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(eid.clone(), RegisteredTarget::Application(application.clone()));
+            .insert(
+                eid.clone(),
+                RegisteredTarget::Application(application.clone()),
+            );
         let sink = Box::new(MockAppSink {
             eid: eid.clone(),
             inner: self.inner.clone(),

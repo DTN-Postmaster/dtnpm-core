@@ -19,9 +19,9 @@ pub mod routing;
 pub mod security;
 pub mod service_tracker;
 
-pub use bpa_client::{BpaClient, LocalBpaClient};
 #[cfg(feature = "transport-grpc")]
 pub use bpa_client::GrpcBpaClient;
+pub use bpa_client::{BpaClient, LocalBpaClient};
 pub use config::HamConfig;
 pub use internal_storage::{FileBundleRecord, InternalStorage};
 pub use log_buffer::{LogBuffer, LogBufferLayer, LogEntry};
