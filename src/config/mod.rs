@@ -351,7 +351,7 @@ pub struct WebConfig {
     pub address: SocketAddr,
 
     /// Directory containing static web assets (Vite dist).
-    #[serde(default = "default_web_static_dir", alias = "web-dist")]
+    #[serde(default = "default_web_static_dir", alias = "web-dist", alias = "static_dir")]
     pub static_dir: PathBuf,
 }
 
