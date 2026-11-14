@@ -1,0 +1,26 @@
+# Expects sibling checkouts of hardy (`../../hardy`) alongside `dtnpm-core`.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Rust Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dtn-postmaster/dtnpm-core
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dtn-postmaster/dtnpm-core
+      - name: Run cargo test
+        working-directory: dtn-postmaster/dtnpm-core
+        run: cargo test --all-features

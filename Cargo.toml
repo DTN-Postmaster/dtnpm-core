@@ -1,0 +1,53 @@
+[package]
+name = "dtnpm-core"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dtn-postmaster/dtnpm-core"
+description = "Core traits, configuration, storage, pacing, BPsec keystore, and BPA transport clients for dtn-postmaster"
+
+[features]
+default = ["transport-local", "transport-grpc"]
+transport-local = []
+transport-grpc = ["dep:hardy-proto"]
+instrument = ["hardy-async/instrument", "hardy-bpa/instrument", "tracing/attributes"]
+
+[dependencies]
+hardy-async = { version = "0.2", path = "../../hardy/async" }
+hardy-bpa = { version = "0.2", path = "../../hardy/bpa", default-features = false, features = ["serde", "rfc9173", "tokio"] }
+hardy-bpv7 = { version = "0.6", path = "../../hardy/bpv7", features = ["std", "serde", "rfc9173"] }
+hardy-cbor = { path = "../../hardy/cbor" }
+hardy-eid-patterns = { version = "0.4", path = "../../hardy/eid-patterns", features = ["serde", "dtn-pat-item"] }
+hardy-proto = { version = "0.2", path = "../../hardy/proto", features = ["serde"], optional = true }
+hardy-tcpclv4 = { version = "0.4", path = "../../hardy/tcpclv4", features = ["serde"] }
+
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+ciborium = "0.2"
+clap = { version = "4", features = ["derive"] }
+config = { version = "0.15", features = ["yaml", "toml", "json"] }
+directories = "5"
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+humantime = "2"
+regex = "1"
+rusqlite = { version = "0.40", features = ["array", "bundled", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha1 = "0.10"
+sha2 = "0.10"
+subtle = "2"
+tempfile = "3"
+thiserror = "2"
+time = { version = "0.3", features = ["parsing", "formatting", "local-offset"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "net", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+zeroize = { version = "1.8", features = ["derive"] }

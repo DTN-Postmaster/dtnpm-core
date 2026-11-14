@@ -1,0 +1,280 @@
+//! Convergence Layer Adapter configuration for Hamradio BPA.
+
+use core::num::NonZeroU64;
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+
+/// CLA entry in configuration file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaConfig {
+    /// Human-readable unique name for this CLA instance.
+    pub name: String,
+    /// Specific CLA type and configuration.
+    #[serde(flatten)]
+    pub cla_type: ClaType,
+    /// Optional egress policy name.
+    #[serde(default)]
+    pub policy: Option<String>,
+    /// Optional contact schedule for this CLA.
+    #[serde(default)]
+    pub schedule: Option<ScheduleConfig>,
+}
+
+/// Supported CLA protocol engines.
+///
+/// Built-in node-level/core variants (`tcpclv4`, `mercury-arq`) have typed
+/// configurations here, while external plugin CLAs (such as `ltp`, `hqfbp`, or
+/// future hardware adapters) deserialize into [`ClaType::Other`] without creating
+/// cyclic dependencies on external CLA crates.
+#[derive(Debug, Clone)]
+pub enum ClaType {
+    /// TCPCL v4 convergence layer (RFC 9174).
+    TcpClv4(Tcpclv4HamConfig),
+
+    /// Mercury connected ARQ convergence layer.
+    MercuryArq(MercuryArqHamConfig),
+
+    /// Generic plugin CLA configuration keyed by `type` (e.g. `ltp`, `hqfbp`).
+    Other {
+        cla_type: String,
+        config: serde_json::Value,
+    },
+}
+
+impl ClaType {
+    /// Returns the canonical protocol type identifier (e.g. `"tcpclv4"`, `"ltp"`, `"hqfbp"`).
+    #[must_use]
+    pub fn type_name(&self) -> &str {
+        match self {
+            Self::TcpClv4(_) => "tcpclv4",
+            Self::MercuryArq(_) => "mercury-arq",
+            Self::Other { cla_type, .. } => cla_type.as_str(),
+        }
+    }
+
+    /// Constructs a [`ClaType::Other`] variant from any serializable CLA configuration.
+    pub fn custom<T: Serialize>(
+        cla_type: impl Into<String>,
+        config: &T,
+    ) -> Result<Self, serde_json::Error> {
+        Ok(Self::Other {
+            cla_type: cla_type.into(),
+            config: serde_json::to_value(config)?,
+        })
+    }
+
+    /// Attempts to deserialize a [`ClaType::Other`] payload as a concrete typed CLA config
+    /// if its `type` matches `expected_type` (or returns `Ok(None)` otherwise).
+    pub fn parse_as<T: serde::de::DeserializeOwned>(
+        &self,
+        expected_type: &str,
+    ) -> Result<Option<T>, serde_json::Error> {
+        match self {
+            Self::Other { cla_type, config } if cla_type == expected_type => {
+                serde_json::from_value(config.clone()).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+impl Serialize for ClaType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (tag, value) = match self {
+            Self::TcpClv4(cfg) => ("tcpclv4", serde_json::to_value(cfg)),
+            Self::MercuryArq(cfg) => ("mercury-arq", serde_json::to_value(cfg)),
+            Self::Other { cla_type, config } => (cla_type.as_str(), Ok(config.clone())),
+        };
+        let value = value.map_err(serde::ser::Error::custom)?;
+        let mut map = match value {
+            serde_json::Value::Object(m) => m,
+            serde_json::Value::Null => serde_json::Map::new(),
+            other => {
+                let mut m = serde_json::Map::new();
+                m.insert("value".to_string(), other);
+                m
+            }
+        };
+        map.insert("type".to_string(), serde_json::Value::String(tag.to_string()));
+        map.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClaType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut map = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        let raw_type = map
+            .remove("type")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .ok_or_else(|| serde::de::Error::missing_field("type"))?;
+        match raw_type.as_str() {
+            "tcpclv4" | "tcpcl" => serde_json::from_value(serde_json::Value::Object(map))
+                .map(Self::TcpClv4)
+                .map_err(serde::de::Error::custom),
+            "mercury-arq" | "mercury" => serde_json::from_value(serde_json::Value::Object(map))
+                .map(Self::MercuryArq)
+                .map_err(serde::de::Error::custom),
+            _ => Ok(Self::Other {
+                cla_type: raw_type,
+                config: serde_json::Value::Object(map),
+            }),
+        }
+    }
+}
+
+/// Simplified Hamradio-friendly configuration for TCPCLv4.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Tcpclv4HamConfig {
+    /// Single listening socket address (e.g. `"[::]:4556"`).
+    pub address: Option<SocketAddr>,
+
+    /// Multiple listening addresses.
+    pub listeners: Option<Vec<SocketAddr>>,
+
+    /// Whether TLS is mandatory. Disabled by default for amateur radio compliance (Hamnet / 44Net).
+    #[serde(alias = "require_tls", alias = "require-tls")]
+    pub require_tls: Option<bool>,
+
+    /// Outbound peer socket addresses to connect to (e.g. `["44.27.131.233:4556"]`).
+    pub peers: Option<Vec<String>>,
+
+    /// Largest acceptable single-segment payload in bytes.
+    pub segment_mru: Option<NonZeroU64>,
+
+    /// Largest acceptable total bundle transfer in bytes.
+    pub transfer_mru: Option<NonZeroU64>,
+}
+
+fn default_mercury_control() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 8300))
+}
+
+fn default_mercury_data() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 8301))
+}
+
+fn default_bandwidth() -> u32 {
+    2300
+}
+
+/// Configuration for Mercury Connected ARQ CLA.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct MercuryArqHamConfig {
+    /// Local amateur radio callsign (inherits from root config if not set).
+    pub my_callsign: Option<String>,
+    /// Control TCP port address (default: 127.0.0.1:8300).
+    pub control_addr: SocketAddr,
+    /// Data TCP port address (default: 127.0.0.1:8301).
+    pub data_addr: SocketAddr,
+    /// ARQ bandwidth in Hz (default: 2300).
+    pub bandwidth: u32,
+    /// Idle disconnect timeout.
+    #[serde(with = "humantime_duration_opt", default)]
+    pub idle_timeout: Option<std::time::Duration>,
+    /// Grace period for in-flight bundle drain upon window expiration (default: 30s).
+    #[serde(with = "humantime_duration_opt", default)]
+    pub grace_period: Option<std::time::Duration>,
+    /// Connect handshake timeout (default: 30s).
+    #[serde(with = "humantime_duration_opt", default)]
+    pub connect_timeout: Option<std::time::Duration>,
+    /// Configured peers and contact schedules.
+    pub peers: Vec<MercuryPeerHamConfig>,
+}
+
+impl Default for MercuryArqHamConfig {
+    fn default() -> Self {
+        Self {
+            my_callsign: None,
+            control_addr: default_mercury_control(),
+            data_addr: default_mercury_data(),
+            bandwidth: default_bandwidth(),
+            idle_timeout: None,
+            grace_period: Some(std::time::Duration::from_secs(30)),
+            connect_timeout: Some(std::time::Duration::from_secs(30)),
+            peers: Vec::new(),
+        }
+    }
+}
+
+/// Configuration entry for a peer in Mercury Connected ARQ mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct MercuryPeerHamConfig {
+    /// Remote callsign.
+    pub callsign: String,
+    /// Remote node EID. If omitted, defaults to `dtn://<callsign>/`.
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// Optional scheduled contact plan.
+    #[serde(default)]
+    pub schedule: Option<ScheduleConfig>,
+}
+
+impl MercuryPeerHamConfig {
+    /// Returns the effective Node ID string for this peer.
+    #[must_use]
+    pub fn effective_node_id(&self) -> String {
+        if let Some(ref nid) = self.node_id {
+            nid.clone()
+        } else {
+            format!("dtn://{}/", self.callsign.to_lowercase())
+        }
+    }
+}
+
+/// Contact schedule configuration (recurring cron or one-shot).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "type")]
+pub enum ScheduleConfig {
+    #[serde(rename = "recurring", alias = "cron")]
+    Recurring {
+        cron: String,
+        #[serde(with = "humantime_duration")]
+        duration: std::time::Duration,
+    },
+    #[serde(rename = "one-shot", alias = "oneshot")]
+    OneShot {
+        #[serde(default)]
+        start: Option<String>,
+        #[serde(default)]
+        end: Option<String>,
+    },
+}
+
+mod humantime_duration {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(duration: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(&humantime::format_duration(*duration))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        let text = String::deserialize(d)?;
+        humantime::parse_duration(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+mod humantime_duration_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(duration: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
+        match duration {
+            Some(d) => s.collect_str(&humantime::format_duration(*d)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+        let opt: Option<String> = Option::deserialize(d)?;
+        match opt {
+            Some(text) => humantime::parse_duration(&text)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
