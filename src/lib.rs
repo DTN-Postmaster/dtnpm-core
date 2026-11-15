@@ -8,6 +8,7 @@ pub mod basket;
 pub mod bpa_client;
 pub mod bundle_inspector;
 pub mod cla_manager;
+pub mod cla_observer;
 pub mod cli_security;
 pub mod config;
 pub mod coordinator;

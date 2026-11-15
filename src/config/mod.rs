@@ -49,6 +49,10 @@ pub struct HamConfig {
     /// Static routing definitions.
     pub routes: Vec<RouteConfig>,
 
+    /// Optional OPA/Rego routing policy overrides (`dtnpm-mod-rego-routing`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rego_routing: Option<RegoRoutingYamlConfig>,
+
     /// SenML telemetry and dashboard configuration.
     #[serde(default)]
     pub senml: Option<SenmlConfig>,
@@ -83,6 +87,7 @@ impl Default for HamConfig {
             clas: Vec::new(),
             routes: Vec::new(),
             senml: None,
+            rego_routing: None,
             rfc9171_validity: Some(Rfc9171ValidityConfig::default()),
             auth: AuthConfig::default(),
             tls: TlsConfig::default(),
@@ -584,7 +589,7 @@ impl Default for WebConfig {
 }
 
 /// Static routing entry mapping an EID pattern to a CLA and next hop.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct RouteConfig {
     /// EID pattern to match (e.g. `dtn://*/*` or `ipn:*.*`).
@@ -595,6 +600,31 @@ pub struct RouteConfig {
 
     /// Optional next hop address (e.g. `44.27.131.233:4556` or callsign).
     pub next_hop: Option<String>,
+
+    /// Optional route action (`via` by default, or `forward-replicate` for Spray-and-Wait).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+/// Optional OPA/Rego routing policy overrides in `HamConfig`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RegoRoutingYamlConfig {
+    /// Directory containing optional `dtn_constants.rego`, `helpers.rego`, `ingress.rego`, `egress.rego`, `routing.rego`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_dir: Option<PathBuf>,
+
+    /// Inline override for `ingress.rego`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_ingress_rego: Option<String>,
+
+    /// Inline override for `egress.rego`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_egress_rego: Option<String>,
+
+    /// Inline override for `routing.rego` (`package dtn.routing`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_routing_rego: Option<String>,
 }
 
 /// SenML telemetry configuration block.

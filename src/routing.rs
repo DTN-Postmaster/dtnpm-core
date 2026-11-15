@@ -75,7 +75,17 @@ impl RouteManager {
             100
         };
 
-        Ok((pattern, RouteAction::Via(via_eid), priority))
+        let action = match route.action.as_deref() {
+            Some(a)
+                if a.eq_ignore_ascii_case("forward-replicate")
+                    || a.eq_ignore_ascii_case("forward_replicate") =>
+            {
+                RouteAction::ForwardReplicate(via_eid)
+            }
+            _ => RouteAction::Via(via_eid),
+        };
+
+        Ok((pattern, action, priority))
     }
 
     /// Pushes a single route into the Hardy BPA RoutingSink.

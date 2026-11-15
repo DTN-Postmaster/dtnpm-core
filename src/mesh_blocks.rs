@@ -767,8 +767,11 @@ fn decode_replication_control(val: &CborValue) -> Result<ReplicationControl, Mes
             _ => {}
         }
     }
+    let quota = quota.ok_or_else(|| {
+        MeshBlockError::CborDecode("replication-control missing required quota".to_string())
+    })?;
     Ok(ReplicationControl {
-        quota: quota.unwrap_or(0),
+        quota,
         mode,
         phase,
         generation,
@@ -1053,6 +1056,19 @@ pub fn format_aprs_path(elements: &[PathElement]) -> String {
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Returns BPv7 primary-block flags requesting all RFC 9171 status reports
+/// (receipt, forward, delivery, deletion) with event timestamps.
+pub fn status_report_flags() -> hardy_bpv7::bundle::Flags {
+    hardy_bpv7::bundle::Flags {
+        report_status_time: true,
+        receipt_report_requested: true,
+        forward_report_requested: true,
+        delivery_report_requested: true,
+        delete_report_requested: true,
+        ..Default::default()
+    }
 }
 
 /// Attaches optional Hop Count (Type 10), APRS Trajectory (Type 200), and Spray-and-Wait
