@@ -14,6 +14,7 @@ pub mod coordinator;
 pub mod iam;
 pub mod internal_storage;
 pub mod log_buffer;
+pub mod mesh_blocks;
 pub mod mock_bpa;
 pub mod pacing;
 pub mod routing;

@@ -72,6 +72,8 @@ pub struct BundleDetail {
     pub hex_dump: Option<String>,
     #[serde(default = "default_auth_status")]
     pub auth_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_extensions: Option<crate::mesh_blocks::RoutingExtensionsSummary>,
 }
 
 /// Infers the MIME type and whether a payload is binary or textual.
@@ -643,6 +645,9 @@ pub async fn get_bundle_detail(
 
     let storage_name = lookup_bundle_storage_info(db_path, bundle_key)?.and_then(|(_, name)| name);
 
+    let routing_extensions =
+        extract_bundle_routing_extensions(payload_dir, storage_name.as_deref()).await;
+
     let (payload_bytes, _) =
         if let Some((bytes, mime)) = get_bundle_payload(db_path, payload_dir, bundle_key).await? {
             (bytes, mime)
@@ -693,7 +698,44 @@ pub async fn get_bundle_detail(
         payload_preview,
         hex_dump,
         auth_status: summary.auth_status,
+        routing_extensions,
     }))
+}
+
+async fn extract_bundle_routing_extensions(
+    payload_dir: &Path,
+    storage_name: Option<&str>,
+) -> Option<crate::mesh_blocks::RoutingExtensionsSummary> {
+    let name = storage_name?;
+    let payload_path = safe_payload_path(payload_dir, name).ok()?;
+    let meta = tokio::fs::metadata(&payload_path).await.ok()?;
+    let file_len = meta.len();
+    if file_len == 0 {
+        return None;
+    }
+
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(&payload_path).await.ok()?;
+    let to_read = (file_len.min(256 * 1024)) as usize;
+    let mut buf = vec![0u8; to_read];
+    file.read_exact(&mut buf).await.ok()?;
+
+    let raw = bytes::Bytes::from(buf);
+    let mut parser = hardy_bpv7::parse::BundleParser::default();
+    let parsed = match parser.push(raw.clone()) {
+        Ok(hardy_bpv7::parse::ParserProgress::Ready(b)) => parser.finish(b).ok()?,
+        Ok(hardy_bpv7::parse::ParserProgress::Partial { consumed, .. }) => {
+            parser.finish(consumed).ok()?
+        }
+        _ => return None,
+    };
+
+    let summary = crate::mesh_blocks::extract_routing_extensions(&parsed.bundle, &parsed.data);
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary)
+    }
 }
 
 /// Deletes a bundle and its payload file from storage.
