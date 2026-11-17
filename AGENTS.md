@@ -1,46 +1,48 @@
 # Agent Guide — `dtnpm-core`
 
 ## 🎯 Mission
-Fournir les briques fondatrices et partagées de l'écosystème DTN Postmaster : configuration unifiée (`HamConfig`), persistance locale SQLite (`internal_storage`), gestionnaire de couches de convergence (`cla_manager`), suivi des services (`service_tracker`), passerelle de sécurité gRPC (`iam::grpc_guard`), contrôle d'accès PBAC, keystore BPSec (RFC 9172) et abstractions clientes du BPA (`BpaClient`).
+Provide the foundational and shared building blocks of the DTN Postmaster ecosystem: unified configuration (`HamConfig`), local SQLite persistence (`internal_storage`), convergence layer manager (`cla_manager`), service tracker (`service_tracker`), gRPC security gateway (`iam::grpc_guard`), PBAC access control, BPSec keystore (RFC 9172), and BPA client abstractions (`BpaClient`).
 
 ---
 
-## 🛡️ Référentiels et Exigences de Sécurité
+## 🛡️ Security Frameworks and Requirements
 
 ### 1. Cyber Resilience Act (CRA)
-- **Sécurité par défaut (Secure-by-Default)** :
-  - Aucune API ou service ne doit exposer d'interface non authentifiée par défaut.
-  - La barrière d'enregistrement gRPC (`GrpcRegistrationGate` / `GuardedBpaRegistration`) empêche tout contournement ou condition de course TOCTOU lors du démarrage du serveur BPA.
-- **Gestion des vulnérabilités & VEX** :
-  - Dépendances auditées via `cargo-audit` et `cargo-deny`.
-  - Le fichier `.cargo/audit.toml` consigne la déclaration VEX `not_affected` pour `RUSTSEC-2026-0459` (extension SQLite `session` non compilée/inutilisée).
-  - Les dépendances YAML utilisent `yaml_serde` (remplaçant `serde_yaml` et `unsafe-libyaml`).
-  - Workflows GitHub Actions avec permissions minimales `permissions: contents: read` et actions épinglées par SHA-1 complet à 40 caractères.
-- **Politique de sécurité** : Tenue à jour dans [SECURITY.md](SECURITY.md).
+- **Secure-by-Default**:
+  - No API or service may expose an unauthenticated interface by default.
+  - The gRPC registration gate (`GrpcRegistrationGate` / `GuardedBpaRegistration`) prevents any bypass or TOCTOU race condition during BPA server startup.
+- **Vulnerability Management & VEX**:
+  - Dependencies audited via `cargo-audit` and `cargo-deny`.
+  - The `.cargo/audit.toml` file records the VEX `not_affected` statement for `RUSTSEC-2026-0459` (SQLite `session` extension not compiled/unused).
+  - YAML dependencies use `yaml_serde` (replacing `serde_yaml` and `unsafe-libyaml`).
+  - GitHub Actions workflows use minimal `permissions: contents: read` and actions pinned by full 40-character SHA-1.
+- **Security Policy**: Maintained in [SECURITY.md](SECURITY.md).
 
-### 2. OWASP & Contrôle d'Accès
-- **Isolation des accès gRPC & UNIX** :
-  - Authentification obligatoire par jeton Bearer ou socket UNIX locale dédiée.
-  - Les jetons sont résolus via `--token-file` / `DTN_HDY_TOKEN_FILE` sans transit en clair dans la table des processus.
-- **PBAC (Policy-Based Access Control)** :
-  - Politiques d'autorisation évaluées via le moteur Rego (`regorus`), avec gestion stricte des contextes et rôles (`operator`, `admin`).
-- **BPSec (RFC 9172)** :
-  - Vérification cryptographique stricte par défaut : un bundle non signé ou avec clé manquante ne doit pas être validé sous `VerifyPolicy::Strict`.
-
----
-
-## 🦀 Standards d'Ingénierie Rust
-
-1. **Règle Zéro Panic / Zéro Unwrap** :
-   - Tout le code sous `src/` doit être 100% exempt de `.unwrap()`, `.expect()` et de `panic!`.
-   - Utiliser `?`, `thiserror`, et des conversions sûres.
-   - Validation stricte : `-D warnings -D clippy::unwrap_used -D clippy::panic`.
-2. **Architecture Decision Records (ADRs)** :
-   - Toute décision d'architecture doit être documentée sous `adr/` et indexée dans [adr/README.md](adr/README.md).
+### 2. OWASP & Access Control
+- **gRPC & UNIX Access Isolation**:
+  - Mandatory authentication via Bearer token or dedicated local UNIX socket.
+  - Tokens are resolved via `--token-file` / `DTN_HDY_TOKEN_FILE` without passing in plaintext in the process table.
+- **PBAC (Policy-Based Access Control)**:
+  - Authorization policies evaluated via the Rego engine (`regorus`), with strict handling of contexts and roles (`operator`, `admin`).
+- **BPSec (RFC 9172)**:
+  - Strict cryptographic verification by default: an unsigned bundle or one with a missing key must not be validated under `VerifyPolicy::Strict`.
 
 ---
 
-## ⚡ Commandes Critiques de Vérification
+## 🦀 Rust Engineering Standards
+
+1. **Zero Panic / Zero Unwrap Rule**:
+   - All code under `src/` must be 100% free of `.unwrap()`, `.expect()`, and `panic!`.
+   - Use `?`, `thiserror`, and safe conversions.
+   - Strict validation: `-D warnings -D clippy::unwrap_used -D clippy::panic`.
+2. **Architecture Decision Records (ADRs)**:
+   - Every architectural decision must be documented under `adr/` and indexed in [adr/README.md](adr/README.md).
+3. **Documentation Language**:
+   - English must be used as the language for all documentation, unless the file is suffixed with `.fr.md` or another language is explicitly requested in the prompt.
+
+---
+
+## ⚡ Critical Verification Commands
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --offline --workspace --lib --bins -- -D warnings -D clippy::unwrap_used -D clippy::panic`
