@@ -6,7 +6,9 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,7 +26,9 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use subtle::ConstantTimeEq;
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 
 use crate::config::{GrpcAuthConfig, GrpcTokenEntry};
@@ -487,6 +491,7 @@ impl GrpcSecurityGateway {
             });
         }
 
+        #[cfg(unix)]
         if let Some(ref sock_path) = auth_cfg.socket_path {
             if let Some(parent) = sock_path.parent()
                 && !parent.as_os_str().is_empty()
@@ -497,7 +502,6 @@ impl GrpcSecurityGateway {
                 let _ = std::fs::remove_file(sock_path);
             }
             let uds_listener = UnixListener::bind(sock_path)?;
-            #[cfg(unix)]
             apply_unix_socket_permissions(sock_path, &auth_cfg)?;
             info!(
                 "gRPC Unix Domain Socket listener bound at {} -> {}",
@@ -554,6 +558,13 @@ impl GrpcSecurityGateway {
                     }
                 }
             });
+        }
+
+        #[cfg(not(unix))]
+        if auth_cfg.socket_path.is_some() {
+            warn!(
+                "gRPC Unix Domain Socket listener is only supported on Unix platforms; ignoring socket_path"
+            );
         }
 
         Ok(active_socket_path)
@@ -793,14 +804,22 @@ async fn handle_client_bridge_conn(
     token: Option<String>,
 ) -> anyhow::Result<()> {
     let mut upstream_sender = if let Some(ref sock_path) = target_socket {
-        let uds = UnixStream::connect(sock_path).await?;
-        let (sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-            .handshake::<_, Incoming>(TokioIo::new(uds))
-            .await?;
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-        sender
+        #[cfg(unix)]
+        {
+            let uds = UnixStream::connect(sock_path).await?;
+            let (sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+                .handshake::<_, Incoming>(TokioIo::new(uds))
+                .await?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            sender
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = sock_path;
+            anyhow::bail!("gRPC Unix Domain Socket client is not supported on this platform");
+        }
     } else {
         let tcp = TcpStream::connect(&target_tcp).await?;
         let _ = tcp.set_nodelay(true);
