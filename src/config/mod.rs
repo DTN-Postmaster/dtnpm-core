@@ -14,7 +14,7 @@ fn default_grpc_addr() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 50051))
 }
 
-/// Root configuration structure for `dtn-hdy-ham`.
+/// Root configuration structure for `dtnpm`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct HamConfig {
@@ -122,7 +122,7 @@ impl Default for Rfc9171ValidityConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct StorageConfig {
-    /// Directory for pending bundle payloads and SQLite database. Defaults to `~/.local/share/dtn-hdy-ham`.
+    /// Directory for pending bundle payloads and SQLite database. Defaults to `~/.local/share/dtnpm`.
     pub data_dir: Option<PathBuf>,
 
     /// Path to SQLite database file. Kept for backwards compatibility.
@@ -143,7 +143,7 @@ impl StorageConfig {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."))
         } else if let Some(base_dirs) = directories::BaseDirs::new() {
-            base_dirs.data_local_dir().join("dtn-hdy-ham")
+            base_dirs.data_local_dir().join("dtnpm")
         } else {
             PathBuf::from("./data")
         }
@@ -519,8 +519,8 @@ pub fn default_web_static_dir() -> PathBuf {
         PathBuf::from("ui/dist")
     } else if Path::new("../dtnpm-web-core/ui/dist").exists() {
         PathBuf::from("../dtnpm-web-core/ui/dist")
-    } else if Path::new("dtn-hdy-ham/web/dist").exists() {
-        PathBuf::from("dtn-hdy-ham/web/dist")
+    } else if Path::new("dtnpm/web/dist").exists() {
+        PathBuf::from("dtnpm/web/dist")
     } else if let Ok(exe) = std::env::current_exe() {
         let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
         let candidate = exe_dir.join("web").join("dist");
@@ -737,7 +737,7 @@ impl HamConfig {
     }
 
     fn find_default_config() -> Option<PathBuf> {
-        let local_names = ["dtn-hdy-ham.toml", "dtn-hdy-ham.yaml", "config.yaml"];
+        let local_names = ["dtnpm.toml", "dtnpm.yaml", "config.toml", "config.yaml"];
         for name in local_names {
             let p = PathBuf::from(name);
             if p.exists() && !Self::is_empty_file(&p) {
@@ -746,18 +746,20 @@ impl HamConfig {
         }
 
         if let Some(base_dirs) = directories::BaseDirs::new() {
-            let user_conf = base_dirs
-                .config_dir()
-                .join("dtn-hdy-ham")
-                .join("config.yaml");
-            if user_conf.exists() && !Self::is_empty_file(&user_conf) {
-                return Some(user_conf);
+            let user_dir = base_dirs.config_dir().join("dtnpm");
+            for name in ["config.toml", "config.yaml"] {
+                let user_conf = user_dir.join(name);
+                if user_conf.exists() && !Self::is_empty_file(&user_conf) {
+                    return Some(user_conf);
+                }
             }
         }
 
-        let sys_conf = PathBuf::from("/etc/dtn-hdy-ham/config.yaml");
-        if sys_conf.exists() && !Self::is_empty_file(&sys_conf) {
-            return Some(sys_conf);
+        for sys_path in ["/etc/dtnpm/config.toml", "/etc/dtnpm/config.yaml"] {
+            let sys_conf = PathBuf::from(sys_path);
+            if sys_conf.exists() && !Self::is_empty_file(&sys_conf) {
+                return Some(sys_conf);
+            }
         }
 
         None
