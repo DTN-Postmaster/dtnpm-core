@@ -174,13 +174,13 @@ pub struct MercuryArqHamConfig {
     /// ARQ bandwidth in Hz (default: 2300).
     pub bandwidth: u32,
     /// Idle disconnect timeout.
-    #[serde(with = "humantime_duration_opt", default)]
+    #[serde(with = "crate::duration::serde_duration_opt", default)]
     pub idle_timeout: Option<std::time::Duration>,
     /// Grace period for in-flight bundle drain upon window expiration (default: 30s).
-    #[serde(with = "humantime_duration_opt", default)]
+    #[serde(with = "crate::duration::serde_duration_opt", default)]
     pub grace_period: Option<std::time::Duration>,
     /// Connect handshake timeout (default: 30s).
-    #[serde(with = "humantime_duration_opt", default)]
+    #[serde(with = "crate::duration::serde_duration_opt", default)]
     pub connect_timeout: Option<std::time::Duration>,
     /// Configured peers and contact schedules.
     pub peers: Vec<MercuryPeerHamConfig>,
@@ -234,7 +234,7 @@ pub enum ScheduleConfig {
     #[serde(rename = "recurring", alias = "cron")]
     Recurring {
         cron: String,
-        #[serde(with = "humantime_duration")]
+        #[serde(with = "crate::duration::serde_duration")]
         duration: std::time::Duration,
     },
     #[serde(rename = "one-shot", alias = "oneshot")]
@@ -244,40 +244,4 @@ pub enum ScheduleConfig {
         #[serde(default)]
         end: Option<String>,
     },
-}
-
-mod humantime_duration {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use std::time::Duration;
-
-    pub fn serialize<S: Serializer>(duration: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_str(&humantime::format_duration(*duration))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
-        let text = String::deserialize(d)?;
-        humantime::parse_duration(&text).map_err(serde::de::Error::custom)
-    }
-}
-
-mod humantime_duration_opt {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use std::time::Duration;
-
-    pub fn serialize<S: Serializer>(duration: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
-        match duration {
-            Some(d) => s.collect_str(&humantime::format_duration(*d)),
-            None => s.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
-        let opt: Option<String> = Option::deserialize(d)?;
-        match opt {
-            Some(text) => humantime::parse_duration(&text)
-                .map(Some)
-                .map_err(serde::de::Error::custom),
-            None => Ok(None),
-        }
-    }
 }

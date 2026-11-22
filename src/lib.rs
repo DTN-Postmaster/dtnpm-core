@@ -12,6 +12,7 @@ pub mod cla_observer;
 pub mod cli_security;
 pub mod config;
 pub mod coordinator;
+pub mod duration;
 pub mod iam;
 pub mod internal_storage;
 pub mod log_buffer;

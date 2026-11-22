@@ -387,7 +387,7 @@ pub fn parse_duration_secs(s: &str) -> u64 {
     if let Ok(secs) = trimmed.parse::<u64>() {
         return secs.max(1);
     }
-    humantime::parse_duration(trimmed)
+    crate::duration::parse_duration(trimmed)
         .map(|d| d.as_secs().max(1))
         .unwrap_or(86_400)
 }
