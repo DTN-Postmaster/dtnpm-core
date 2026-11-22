@@ -12,6 +12,8 @@ use argon2::password_hash::SaltString;
 use argon2::password_hash::rand_core::OsRng as ArgonOsRng;
 use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version};
 use hardy_async::CancellationToken;
+use hardy_bpa::services::StatusNotify;
+use hardy_bpv7::status_report::ReasonCode;
 use rand::RngCore;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -909,36 +911,37 @@ impl InternalStorage {
             "#,
         )?;
 
-        let rows = stmt.query_map([norm], |row| {
-            Ok(ChatMessage {
-                id: row.get(0)?,
-                conversation_peer: row.get(1)?,
-                sender_eid: row.get(2)?,
-                recipient_eid: row.get(3)?,
-                content: row.get(4)?,
-                direction: row.get(5)?,
-                status: row.get(6)?,
-                is_read: row.get::<_, i64>(7)? != 0,
-                is_sticky: row.get::<_, i64>(8)? != 0,
-                timestamp: row.get(9)?,
-                expiry_timestamp: row.get(10)?,
-                created_at: row.get(11)?,
-                auth_status: row
-                    .get::<_, Option<String>>(12)?
-                    .unwrap_or_else(default_auth_status),
-                delivery_status: row.get(13)?,
-                delivery_reason: row
-                    .get::<_, Option<i64>>(14)?
-                    .and_then(|v| u64::try_from(v).ok()),
-                delivery_updated_at: row.get(15)?,
-            })
-        })?;
+        let rows = stmt.query_map([norm], map_chat_message_row)?;
 
         let mut list = Vec::new();
         for r in rows {
             list.push(r?);
         }
         Ok(list)
+    }
+
+    /// Gets a single chat message by bundle ID.
+    pub fn get_chat_message(&self, id: &str) -> anyhow::Result<Option<ChatMessage>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, conversation_peer, sender_eid, recipient_eid, content,
+                   direction, status, is_read, is_sticky, timestamp, expiry_timestamp, created_at,
+                   auth_status, delivery_status, delivery_reason, delivery_updated_at
+            FROM chat_messages
+            WHERE id = ?1
+            "#,
+        )?;
+
+        let mut rows = stmt.query_map(params![id], map_chat_message_row)?;
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Marks all inbound messages from a peer as read.
@@ -1780,6 +1783,55 @@ pub fn spawn_expiration_reaper(
                 _ = tokio::time::sleep(sleep_duration) => {}
             }
         }
+    })
+}
+
+/// Converts an RFC 9171 [`StatusNotify`] callback payload into `(status_str, reason_code, timestamp_ms)`.
+#[must_use]
+pub fn status_notify_to_parts(
+    kind: StatusNotify,
+    reason: ReasonCode,
+    timestamp: Option<OffsetDateTime>,
+) -> (&'static str, u64, i64) {
+    let status_str = match kind {
+        StatusNotify::Received => "received",
+        StatusNotify::Forwarded => "forwarded",
+        StatusNotify::Delivered => "delivered",
+        StatusNotify::Deleted => "deleted",
+    };
+    let reason_u64 = u64::from(reason);
+    let ts_ms = i64::try_from(
+        timestamp
+            .unwrap_or_else(OffsetDateTime::now_utc)
+            .unix_timestamp_nanos()
+            / 1_000_000,
+    )
+    .unwrap_or(0);
+    (status_str, reason_u64, ts_ms)
+}
+
+fn map_chat_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessage> {
+    Ok(ChatMessage {
+        id: row.get(0)?,
+        conversation_peer: row.get(1)?,
+        sender_eid: row.get(2)?,
+        recipient_eid: row.get(3)?,
+        content: row.get(4)?,
+        direction: row.get(5)?,
+        status: row.get(6)?,
+        is_read: row.get::<_, i64>(7)? != 0,
+        is_sticky: row.get::<_, i64>(8)? != 0,
+        timestamp: row.get(9)?,
+        expiry_timestamp: row.get(10)?,
+        created_at: row.get(11)?,
+        auth_status: row
+            .get::<_, Option<String>>(12)?
+            .unwrap_or_else(default_auth_status),
+        delivery_status: row.get(13)?,
+        delivery_reason: row
+            .get::<_, Option<i64>>(14)?
+            .and_then(|v| u64::try_from(v).ok()),
+        delivery_updated_at: row.get(15)?,
     })
 }
 
@@ -2710,5 +2762,64 @@ mod tests {
             assert_eq!(file.delivery_reason, Some(0));
             assert_eq!(file.delivery_updated_at, Some(2002));
         }
+    }
+
+    #[test]
+    fn test_status_notify_to_parts_and_get_chat_message() {
+        let ts = OffsetDateTime::from_unix_timestamp(1_700_000_123).unwrap();
+        assert_eq!(
+            status_notify_to_parts(
+                StatusNotify::Received,
+                ReasonCode::NoAdditionalInformation,
+                Some(ts)
+            ),
+            ("received", 0, 1_700_000_123_000)
+        );
+        assert_eq!(
+            status_notify_to_parts(
+                StatusNotify::Forwarded,
+                ReasonCode::ForwardedOverUnidirectionalLink,
+                Some(ts)
+            ),
+            ("forwarded", 2, 1_700_000_123_000)
+        );
+        assert_eq!(
+            status_notify_to_parts(
+                StatusNotify::Delivered,
+                ReasonCode::NoAdditionalInformation,
+                Some(ts)
+            ),
+            ("delivered", 0, 1_700_000_123_000)
+        );
+        assert_eq!(
+            status_notify_to_parts(StatusNotify::Deleted, ReasonCode::LifetimeExpired, Some(ts)),
+            ("deleted", 1, 1_700_000_123_000)
+        );
+
+        let storage = InternalStorage::new_in_memory().unwrap();
+        assert!(storage.get_chat_message("missing").unwrap().is_none());
+
+        let msg = ChatMessage {
+            id: "chat-lookup-1".to_string(),
+            conversation_peer: "dtn://statb/chat".to_string(),
+            sender_eid: "dtn://stata/chat".to_string(),
+            recipient_eid: "dtn://statb/chat".to_string(),
+            content: "lookup".to_string(),
+            direction: "outbound".to_string(),
+            status: "sent".to_string(),
+            is_read: true,
+            is_sticky: false,
+            timestamp: 1_700_000_000_000,
+            expiry_timestamp: 1_700_003_600_000,
+            created_at: "2026-11-22T12:00:00Z".to_string(),
+            auth_status: "valid".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
+        };
+        storage.insert_chat_message(&msg).unwrap();
+        let fetched = storage.get_chat_message("chat-lookup-1").unwrap().unwrap();
+        assert_eq!(fetched.id, "chat-lookup-1");
+        assert_eq!(fetched.content, "lookup");
     }
 }
