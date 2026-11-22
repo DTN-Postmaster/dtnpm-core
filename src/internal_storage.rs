@@ -52,6 +52,15 @@ pub struct ChatMessage {
     /// Cryptographic authentication status: "valid" | "invalid" | "missing_key" | "unsigned"
     #[serde(default = "default_auth_status")]
     pub auth_status: String,
+    /// Last RFC 9171 status report kind ("received" | "forwarded" | "delivered" | "deleted")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_status: Option<String>,
+    /// Last RFC 9171 status report reason code (numeric)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_reason: Option<u64>,
+    /// Timestamp (Unix ms) of the last RFC 9171 status report update
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_updated_at: Option<i64>,
 }
 
 fn default_auth_status() -> String {
@@ -113,6 +122,15 @@ pub struct FileBundleRecord {
     /// Cryptographic authentication status: "valid" | "invalid" | "missing_key" | "unsigned"
     #[serde(default = "default_auth_status")]
     pub auth_status: String,
+    /// Last RFC 9171 status report kind ("received" | "forwarded" | "delivered" | "deleted")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_status: Option<String>,
+    /// Last RFC 9171 status report reason code (numeric)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_reason: Option<u64>,
+    /// Timestamp (Unix ms) of the last RFC 9171 status report update
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_updated_at: Option<i64>,
 }
 
 /// Registered local operator/administrator account stored in `iam_users`.
@@ -524,7 +542,10 @@ impl InternalStorage {
                 timestamp INTEGER NOT NULL,
                 expiry_timestamp INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
-                auth_status TEXT NOT NULL DEFAULT 'unsigned'
+                auth_status TEXT NOT NULL DEFAULT 'unsigned',
+                delivery_status TEXT,
+                delivery_reason INTEGER,
+                delivery_updated_at INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_chat_peer ON chat_messages(conversation_peer, timestamp);
@@ -546,7 +567,10 @@ impl InternalStorage {
                 is_sticky INTEGER NOT NULL DEFAULT 0,
                 is_read INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
-                auth_status TEXT NOT NULL DEFAULT 'unsigned'
+                auth_status TEXT NOT NULL DEFAULT 'unsigned',
+                delivery_status TEXT,
+                delivery_reason INTEGER,
+                delivery_updated_at INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_files_created ON files_bundles(creation_timestamp DESC);
@@ -636,6 +660,28 @@ impl InternalStorage {
 
             conn.execute_batch("PRAGMA user_version = 2;")?;
         }
+
+        if user_version < 3 {
+            let ensure_column = |table: &str, col: &str, def: &str| -> anyhow::Result<()> {
+                let pragma = format!("PRAGMA table_info({table})");
+                let exists = conn
+                    .prepare(&pragma)?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .any(|c| c.map(|name| name == col).unwrap_or(false));
+                if !exists {
+                    conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {def}"), [])?;
+                }
+                Ok(())
+            };
+
+            for table in ["chat_messages", "files_bundles"] {
+                ensure_column(table, "delivery_status", "TEXT")?;
+                ensure_column(table, "delivery_reason", "INTEGER")?;
+                ensure_column(table, "delivery_updated_at", "INTEGER")?;
+            }
+
+            conn.execute_batch("PRAGMA user_version = 3;")?;
+        }
         Ok(())
     }
 
@@ -663,8 +709,9 @@ impl InternalStorage {
             r#"
             INSERT OR REPLACE INTO chat_messages (
                 id, conversation_peer, sender_eid, recipient_eid, content,
-                direction, status, is_read, is_sticky, timestamp, expiry_timestamp, created_at, auth_status
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                direction, status, is_read, is_sticky, timestamp, expiry_timestamp, created_at,
+                auth_status, delivery_status, delivery_reason, delivery_updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             "#,
             params![
                 msg.id,
@@ -680,6 +727,10 @@ impl InternalStorage {
                 msg.expiry_timestamp,
                 msg.created_at,
                 msg.auth_status,
+                msg.delivery_status,
+                msg.delivery_reason
+                    .map(|r| i64::try_from(r).unwrap_or(i64::MAX)),
+                msg.delivery_updated_at,
             ],
         )?;
         Ok(())
@@ -850,7 +901,8 @@ impl InternalStorage {
         let mut stmt = conn.prepare(
             r#"
             SELECT id, conversation_peer, sender_eid, recipient_eid, content,
-                   direction, status, is_read, is_sticky, timestamp, expiry_timestamp, created_at, auth_status
+                   direction, status, is_read, is_sticky, timestamp, expiry_timestamp, created_at,
+                   auth_status, delivery_status, delivery_reason, delivery_updated_at
             FROM chat_messages
             WHERE conversation_peer = ?1
             ORDER BY timestamp ASC
@@ -874,6 +926,11 @@ impl InternalStorage {
                 auth_status: row
                     .get::<_, Option<String>>(12)?
                     .unwrap_or_else(default_auth_status),
+                delivery_status: row.get(13)?,
+                delivery_reason: row
+                    .get::<_, Option<i64>>(14)?
+                    .and_then(|v| u64::try_from(v).ok()),
+                delivery_updated_at: row.get(15)?,
             })
         })?;
 
@@ -947,8 +1004,9 @@ impl InternalStorage {
             r#"
             INSERT OR REPLACE INTO files_bundles (
                 id, source_eid, destination_eid, creation_timestamp, lifetime_secs,
-                expiry_timestamp, size, payload_path, mime_type, is_sticky, is_read, created_at, auth_status
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                expiry_timestamp, size, payload_path, mime_type, is_sticky, is_read, created_at,
+                auth_status, delivery_status, delivery_reason, delivery_updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             "#,
             params![
                 bundle.id,
@@ -964,6 +1022,11 @@ impl InternalStorage {
                 if bundle.is_read { 1 } else { 0 },
                 bundle.created_at,
                 bundle.auth_status,
+                bundle.delivery_status,
+                bundle
+                    .delivery_reason
+                    .map(|r| i64::try_from(r).unwrap_or(i64::MAX)),
+                bundle.delivery_updated_at,
             ],
         )?;
         Ok(())
@@ -978,31 +1041,14 @@ impl InternalStorage {
         let mut stmt = conn.prepare(
             r#"
             SELECT id, source_eid, destination_eid, creation_timestamp, lifetime_secs,
-                   expiry_timestamp, size, payload_path, mime_type, is_sticky, is_read, created_at, auth_status
+                   expiry_timestamp, size, payload_path, mime_type, is_sticky, is_read, created_at,
+                   auth_status, delivery_status, delivery_reason, delivery_updated_at
             FROM files_bundles
             ORDER BY creation_timestamp DESC
             "#,
         )?;
 
-        let rows = stmt.query_map([], |row| {
-            Ok(FileBundleRecord {
-                id: row.get(0)?,
-                source_eid: row.get(1)?,
-                destination_eid: row.get(2)?,
-                creation_timestamp: row.get(3)?,
-                lifetime_secs: row.get::<_, i64>(4)? as u64,
-                expiry_timestamp: row.get(5)?,
-                size: row.get::<_, i64>(6)? as u64,
-                payload_path: row.get(7)?,
-                mime_type: row.get(8)?,
-                is_sticky: row.get::<_, i64>(9)? != 0,
-                is_read: row.get::<_, i64>(10)? != 0,
-                created_at: row.get(11)?,
-                auth_status: row
-                    .get::<_, Option<String>>(12)?
-                    .unwrap_or_else(default_auth_status),
-            })
-        })?;
+        let rows = stmt.query_map([], map_file_bundle_row)?;
 
         let mut list = Vec::new();
         for r in rows {
@@ -1020,37 +1066,64 @@ impl InternalStorage {
         let mut stmt = conn.prepare(
             r#"
             SELECT id, source_eid, destination_eid, creation_timestamp, lifetime_secs,
-                   expiry_timestamp, size, payload_path, mime_type, is_sticky, is_read, created_at, auth_status
+                   expiry_timestamp, size, payload_path, mime_type, is_sticky, is_read, created_at,
+                   auth_status, delivery_status, delivery_reason, delivery_updated_at
             FROM files_bundles
             WHERE id = ?1
             "#,
         )?;
 
-        let mut rows = stmt.query_map(params![id], |row| {
-            Ok(FileBundleRecord {
-                id: row.get(0)?,
-                source_eid: row.get(1)?,
-                destination_eid: row.get(2)?,
-                creation_timestamp: row.get(3)?,
-                lifetime_secs: row.get::<_, i64>(4)? as u64,
-                expiry_timestamp: row.get(5)?,
-                size: row.get::<_, i64>(6)? as u64,
-                payload_path: row.get(7)?,
-                mime_type: row.get(8)?,
-                is_sticky: row.get::<_, i64>(9)? != 0,
-                is_read: row.get::<_, i64>(10)? != 0,
-                created_at: row.get(11)?,
-                auth_status: row
-                    .get::<_, Option<String>>(12)?
-                    .unwrap_or_else(default_auth_status),
-            })
-        })?;
+        let mut rows = stmt.query_map(params![id], map_file_bundle_row)?;
 
         if let Some(r) = rows.next() {
             Ok(Some(r?))
         } else {
             Ok(None)
         }
+    }
+
+    /// Updates RFC 9171 delivery receipt metadata for a chat bundle without altering `status`.
+    pub fn update_chat_delivery_status(
+        &self,
+        bundle_id: &str,
+        delivery_status: &str,
+        reason_code: u64,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+        update_bundle_delivery_status(
+            &conn,
+            "chat_messages",
+            bundle_id,
+            delivery_status,
+            reason_code,
+            updated_at_ms,
+        )
+    }
+
+    /// Updates RFC 9171 delivery receipt metadata for a file bundle.
+    pub fn update_file_delivery_status(
+        &self,
+        bundle_id: &str,
+        delivery_status: &str,
+        reason_code: u64,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+        update_bundle_delivery_status(
+            &conn,
+            "files_bundles",
+            bundle_id,
+            delivery_status,
+            reason_code,
+            updated_at_ms,
+        )
     }
 
     /// Toggles the sticky retention flag for a file bundle.
@@ -1710,6 +1783,79 @@ pub fn spawn_expiration_reaper(
     })
 }
 
+fn map_file_bundle_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileBundleRecord> {
+    Ok(FileBundleRecord {
+        id: row.get(0)?,
+        source_eid: row.get(1)?,
+        destination_eid: row.get(2)?,
+        creation_timestamp: row.get(3)?,
+        lifetime_secs: row.get::<_, i64>(4)? as u64,
+        expiry_timestamp: row.get(5)?,
+        size: row.get::<_, i64>(6)? as u64,
+        payload_path: row.get(7)?,
+        mime_type: row.get(8)?,
+        is_sticky: row.get::<_, i64>(9)? != 0,
+        is_read: row.get::<_, i64>(10)? != 0,
+        created_at: row.get(11)?,
+        auth_status: row
+            .get::<_, Option<String>>(12)?
+            .unwrap_or_else(default_auth_status),
+        delivery_status: row.get(13)?,
+        delivery_reason: row
+            .get::<_, Option<i64>>(14)?
+            .and_then(|v| u64::try_from(v).ok()),
+        delivery_updated_at: row.get(15)?,
+    })
+}
+
+fn update_bundle_delivery_status(
+    conn: &Connection,
+    table: &str,
+    bundle_id: &str,
+    delivery_status: &str,
+    reason_code: u64,
+    updated_at_ms: i64,
+) -> anyhow::Result<bool> {
+    if !matches!(
+        delivery_status,
+        "received" | "forwarded" | "delivered" | "deleted"
+    ) {
+        anyhow::bail!("Invalid RFC 9171 delivery status: {delivery_status}");
+    }
+
+    let select_sql = format!("SELECT delivery_status FROM {table} WHERE id = ?1");
+    let current: Option<Option<String>> = rusqlite::OptionalExtension::optional(conn.query_row(
+        &select_sql,
+        params![bundle_id],
+        |r| r.get(0),
+    ))?;
+    let Some(existing) = current else {
+        return Ok(false);
+    };
+
+    if matches!(existing.as_deref(), Some("delivered")) && delivery_status != "delivered" {
+        return Ok(false);
+    }
+    if delivery_status == "received"
+        && matches!(
+            existing.as_deref(),
+            Some("forwarded" | "delivered" | "deleted")
+        )
+    {
+        return Ok(false);
+    }
+
+    let reason_i64 = i64::try_from(reason_code).unwrap_or(i64::MAX);
+    let update_sql = format!(
+        "UPDATE {table} SET delivery_status = ?1, delivery_reason = ?2, delivery_updated_at = ?3 WHERE id = ?4"
+    );
+    let rows = conn.execute(
+        &update_sql,
+        params![delivery_status, reason_i64, updated_at_ms, bundle_id],
+    )?;
+    Ok(rows > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1733,6 +1879,9 @@ mod tests {
             is_read: false,
             created_at: "2026-11-05T00:00:00Z".to_string(),
             auth_status: "unsigned".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
 
         storage.insert_file_bundle(&record).unwrap();
@@ -1778,6 +1927,9 @@ mod tests {
             is_read: false,
             created_at: "2026-11-05T00:00:00Z".to_string(),
             auth_status: "unsigned".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
 
         // Expired but STICKY bundle (must NOT be deleted)
@@ -1795,6 +1947,9 @@ mod tests {
             is_read: false,
             created_at: "2026-11-05T00:00:00Z".to_string(),
             auth_status: "unsigned".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
 
         // Future non-sticky bundle (expiry = 50000)
@@ -1812,6 +1967,9 @@ mod tests {
             is_read: false,
             created_at: "2026-11-05T00:00:00Z".to_string(),
             auth_status: "unsigned".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
 
         storage.insert_file_bundle(&f1).unwrap();
@@ -1858,6 +2016,9 @@ mod tests {
             is_read: false,
             created_at: "2026-11-05T00:00:00Z".to_string(),
             auth_status: "unsigned".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
         storage.insert_file_bundle(&rec).unwrap();
         // Deletion must succeed even if physical file is missing
@@ -1890,6 +2051,9 @@ mod tests {
             expiry_timestamp: dtn_expiry,
             created_at: "2026-11-05T07:25:44Z".to_string(),
             auth_status: "unsigned".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
 
         storage.insert_chat_message(&legacy_msg).unwrap();
@@ -1954,6 +2118,9 @@ mod tests {
             expiry_timestamp: old_24h_expiry,
             created_at: "2026-11-05T08:00:00Z".to_string(),
             auth_status: "unsigned".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
 
         // Sticky message should NOT be modified even if > 3600s
@@ -1971,6 +2138,9 @@ mod tests {
             expiry_timestamp: old_24h_expiry,
             created_at: "2026-11-05T08:00:00Z".to_string(),
             auth_status: "unsigned".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
 
         storage.insert_chat_message(&outbound_msg).unwrap();
@@ -2023,6 +2193,9 @@ mod tests {
             expiry_timestamp: now_ms + (week_secs * 1000),
             created_at: "2026-11-05T08:00:00Z".to_string(),
             auth_status: "unsigned".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
         storage.insert_chat_message(&week_msg).unwrap();
 
@@ -2067,6 +2240,9 @@ mod tests {
             expiry_timestamp: now_ms + 10000,
             created_at: "2026-11-05T00:00:00Z".to_string(),
             auth_status: "unsigned".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
         storage.insert_chat_message(&c_stk).unwrap();
 
@@ -2086,6 +2262,9 @@ mod tests {
             is_read: false,
             created_at: "2026-11-05T00:00:00Z".to_string(),
             auth_status: "unsigned".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
         storage.insert_file_bundle(&f_stk).unwrap();
 
@@ -2104,6 +2283,9 @@ mod tests {
             expiry_timestamp: now_ms - 1000, // expired!
             created_at: "2026-11-05T00:00:00Z".to_string(),
             auth_status: "unsigned".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
         storage.insert_chat_message(&c_exp).unwrap();
 
@@ -2124,6 +2306,9 @@ mod tests {
             is_read: false,
             created_at: "2026-11-05T00:00:00Z".to_string(),
             auth_status: "unsigned".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
         storage.insert_file_bundle(&f_exp).unwrap();
 
@@ -2142,6 +2327,9 @@ mod tests {
             expiry_timestamp: now_ms + 100000, // valid/active
             created_at: "2026-11-05T00:00:00Z".to_string(),
             auth_status: "unsigned".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
         storage.insert_chat_message(&c_act).unwrap();
 
@@ -2162,6 +2350,9 @@ mod tests {
             is_read: false,
             created_at: "2026-11-05T00:00:00Z".to_string(),
             auth_status: "unsigned".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
         storage.insert_file_bundle(&f_act).unwrap();
 
@@ -2362,5 +2553,162 @@ mod tests {
         );
         assert!(storage.revoke_iam_api_token(&tok_rec.id).unwrap());
         assert!(storage.verify_iam_api_token(&raw_tok).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_user_version_3_delivery_status_migration_and_progression() {
+        let tmp = tempfile::tempdir().unwrap();
+        let internal_dir = tmp.path().join("internal_services");
+        let files_dir = internal_dir.join("files");
+        std::fs::create_dir_all(&files_dir).unwrap();
+        let db_path = internal_dir.join("services.db");
+
+        // 1. Seed a legacy PRAGMA user_version = 2 SQLite DB without delivery_* columns
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE chat_conversations (peer TEXT PRIMARY KEY, created_at TEXT NOT NULL);
+                CREATE TABLE chat_messages (
+                    id TEXT PRIMARY KEY,
+                    conversation_peer TEXT NOT NULL,
+                    sender_eid TEXT NOT NULL,
+                    recipient_eid TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    direction TEXT NOT NULL CHECK(direction IN ('inbound', 'outbound')),
+                    status TEXT NOT NULL CHECK(status IN ('queued', 'sent', 'received')),
+                    is_read INTEGER NOT NULL DEFAULT 0,
+                    is_sticky INTEGER NOT NULL DEFAULT 0,
+                    timestamp INTEGER NOT NULL,
+                    expiry_timestamp INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    auth_status TEXT NOT NULL DEFAULT 'unsigned'
+                );
+                CREATE TABLE files_bundles (
+                    id TEXT PRIMARY KEY,
+                    source_eid TEXT NOT NULL,
+                    destination_eid TEXT NOT NULL,
+                    creation_timestamp INTEGER NOT NULL,
+                    lifetime_secs INTEGER NOT NULL,
+                    expiry_timestamp INTEGER NOT NULL,
+                    size INTEGER NOT NULL,
+                    payload_path TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    is_sticky INTEGER NOT NULL DEFAULT 0,
+                    is_read INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    auth_status TEXT NOT NULL DEFAULT 'unsigned'
+                );
+                INSERT INTO chat_conversations (peer, created_at) VALUES ('dtn://statb/chat', '2026-11-22T00:00:00Z');
+                INSERT INTO chat_messages (
+                    id, conversation_peer, sender_eid, recipient_eid, content,
+                    direction, status, is_read, is_sticky, timestamp, expiry_timestamp, created_at, auth_status
+                ) VALUES (
+                    'chat-b-1', 'dtn://statb/chat', 'dtn://stata/chat', 'dtn://statb/chat',
+                    'hello', 'outbound', 'sent', 1, 0, 1700000000000, 1700003600000, '2026-11-22T00:00:00Z', 'valid'
+                );
+                INSERT INTO files_bundles (
+                    id, source_eid, destination_eid, creation_timestamp, lifetime_secs,
+                    expiry_timestamp, size, payload_path, mime_type, is_sticky, is_read, created_at, auth_status
+                ) VALUES (
+                    'file-b-1', 'dtn://stata/files', 'dtn://statb/files', 1700000000000, 3600,
+                    1700003600000, 5, '/tmp/file.bin', 'text/plain', 0, 1, '2026-11-22T00:00:00Z', 'valid'
+                );
+                PRAGMA user_version = 2;
+                "#,
+            )
+            .unwrap();
+        }
+
+        // 2. Open with InternalStorage -> upgrades cleanly to PRAGMA user_version = 3
+        {
+            let storage = InternalStorage::new_disk(tmp.path()).unwrap();
+            let user_ver: i32 = {
+                let conn = storage.conn.lock().unwrap();
+                conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap()
+            };
+            assert_eq!(user_ver, 3);
+
+            // Progress chat status: received -> forwarded -> delivered, reject invalid & downgrade
+            assert!(
+                storage
+                    .update_chat_delivery_status("missing-id", "received", 0, 100)
+                    .unwrap()
+                    == false
+            );
+            assert!(
+                storage
+                    .update_chat_delivery_status("chat-b-1", "invalid-kind", 0, 100)
+                    .is_err()
+            );
+            assert!(
+                storage
+                    .update_chat_delivery_status("chat-b-1", "received", 0, 1001)
+                    .unwrap()
+            );
+            assert!(
+                storage
+                    .update_chat_delivery_status("chat-b-1", "forwarded", 2, 1002)
+                    .unwrap()
+            );
+            // Cannot downgrade forwarded -> received
+            assert!(
+                !storage
+                    .update_chat_delivery_status("chat-b-1", "received", 0, 1003)
+                    .unwrap()
+            );
+            assert!(
+                storage
+                    .update_chat_delivery_status("chat-b-1", "delivered", 0, 1004)
+                    .unwrap()
+            );
+            // Cannot downgrade delivered -> forwarded or deleted
+            assert!(
+                !storage
+                    .update_chat_delivery_status("chat-b-1", "forwarded", 0, 1005)
+                    .unwrap()
+            );
+            assert!(
+                !storage
+                    .update_chat_delivery_status("chat-b-1", "deleted", 1, 1006)
+                    .unwrap()
+            );
+
+            // Progress file status: forwarded -> delivered
+            assert!(
+                storage
+                    .update_file_delivery_status("file-b-1", "forwarded", 0, 2001)
+                    .unwrap()
+            );
+            assert!(
+                storage
+                    .update_file_delivery_status("file-b-1", "delivered", 0, 2002)
+                    .unwrap()
+            );
+            assert!(
+                !storage
+                    .update_file_delivery_status("file-b-1", "received", 0, 2003)
+                    .unwrap()
+            );
+        }
+
+        // 3. Reopen from disk and confirm receipts & legacy status CHECK integrity survived
+        {
+            let storage2 = InternalStorage::new_disk(tmp.path()).unwrap();
+            let msgs = storage2
+                .get_conversation_messages("dtn://statb/chat")
+                .unwrap();
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(msgs[0].status, "sent");
+            assert_eq!(msgs[0].delivery_status.as_deref(), Some("delivered"));
+            assert_eq!(msgs[0].delivery_reason, Some(0));
+            assert_eq!(msgs[0].delivery_updated_at, Some(1004));
+
+            let file = storage2.get_file_bundle("file-b-1").unwrap().unwrap();
+            assert_eq!(file.delivery_status.as_deref(), Some("delivered"));
+            assert_eq!(file.delivery_reason, Some(0));
+            assert_eq!(file.delivery_updated_at, Some(2002));
+        }
     }
 }
