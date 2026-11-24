@@ -606,6 +606,40 @@ pub struct RouteConfig {
     pub action: Option<String>,
 }
 
+/// Configuration for the built-in ANSRVR group subscription & announcement service (`dtn://<node>/ansrvr`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct AnsrvrYamlConfig {
+    /// Enable the built-in `/ansrvr` service (default `true`).
+    pub enabled: bool,
+    /// Local DTN service name (default `"ansrvr"`).
+    pub service_name: String,
+    /// Default subscription TTL in seconds (default `86400` = 24h).
+    pub default_ttl_secs: u64,
+    /// Maximum active groups tracked in SQLite (default `256`).
+    pub max_groups: usize,
+    /// Maximum active members per group (default `256`).
+    pub max_members_per_group: usize,
+    /// Maximum accepted incoming command/announcement payload size in bytes (default `4096`).
+    pub max_payload_bytes: u64,
+    /// Minimum interval in seconds between `CQ` announcements per sender (default `5`).
+    pub cq_rate_limit_secs: u64,
+}
+
+impl Default for AnsrvrYamlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            service_name: "ansrvr".to_string(),
+            default_ttl_secs: 86_400,
+            max_groups: 256,
+            max_members_per_group: 256,
+            max_payload_bytes: 4096,
+            cq_rate_limit_secs: 5,
+        }
+    }
+}
+
 /// Optional OPA/Rego routing policy overrides in `HamConfig`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -637,6 +671,10 @@ pub struct RegoRoutingYamlConfig {
     /// APRS aliases explicitly trapped/dropped at ingress.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trapped_aliases: Vec<String>,
+
+    /// Built-in ANSRVR group subscription & announcement service settings.
+    #[serde(default)]
+    pub ansrvr: AnsrvrYamlConfig,
 }
 
 /// SenML telemetry configuration block.
@@ -984,6 +1022,10 @@ rego-routing:
   record-treb: true
   supported-aliases: ["QO100"]
   trapped-aliases: ["WIDE3"]
+  ansrvr:
+    enabled: true
+    default-ttl-secs: 3600
+    max-groups: 64
 clas:
   - name: "vhf-kiss"
     type: hqfbp
@@ -996,6 +1038,10 @@ clas:
         assert_eq!(rego.record_treb, Some(true));
         assert_eq!(rego.supported_aliases, vec!["QO100"]);
         assert_eq!(rego.trapped_aliases, vec!["WIDE3"]);
+        assert!(rego.ansrvr.enabled);
+        assert_eq!(rego.ansrvr.service_name, "ansrvr");
+        assert_eq!(rego.ansrvr.default_ttl_secs, 3600);
+        assert_eq!(rego.ansrvr.max_groups, 64);
         assert_eq!(cfg.clas[0].effective_aliases(), vec!["2M", "HQFBP", "VHF"]);
         assert_eq!(cfg.clas[1].effective_aliases(), vec!["TCPCL"]);
     }
