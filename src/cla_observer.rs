@@ -12,6 +12,8 @@ use hardy_bpv7::eid::NodeId;
 
 /// Observer notified when a CLA reports a neighbor peer coming up or going down.
 pub trait PeerObserver: Send + Sync {
+    /// Called when a CLA is registered with its configured aliases.
+    fn on_cla_registered(&self, _cla_name: &str, _cla_type: &str, _aliases: &[String]) {}
     fn on_peer_up(&self, cla_name: &str, cla_type: &str, addr: &ClaAddress, node_ids: &[NodeId]);
     fn on_peer_down(&self, cla_name: &str, addr: &ClaAddress);
 }
@@ -33,9 +35,23 @@ impl ObservedCla {
         inner: Arc<dyn Cla>,
         observer: Arc<dyn PeerObserver>,
     ) -> Arc<dyn Cla> {
+        Self::wrap_with_aliases(cla_name, cla_type, Vec::new(), inner, observer)
+    }
+
+    /// Wraps `inner` with peer-change observation and registers `aliases` for `cla_name`.
+    pub fn wrap_with_aliases(
+        cla_name: impl Into<String>,
+        cla_type: impl Into<String>,
+        aliases: Vec<String>,
+        inner: Arc<dyn Cla>,
+        observer: Arc<dyn PeerObserver>,
+    ) -> Arc<dyn Cla> {
+        let cla_name = cla_name.into();
+        let cla_type = cla_type.into();
+        observer.on_cla_registered(&cla_name, &cla_type, &aliases);
         Arc::new(Self {
-            cla_name: cla_name.into(),
-            cla_type: cla_type.into(),
+            cla_name,
+            cla_type,
             inner,
             observer,
         })

@@ -62,15 +62,15 @@ impl RouteManager {
             Eid::Null
         };
 
-        // Default routes (dtn:**, dtn://**, ipn:**, *:**) get lower priority (10)
-        // so specific destinations take precedence (100).
+        // Default wildcard routes (dtn:**, dtn://**, ipn:**, *:**) get lower precedence
+        // (higher priority number 200) so specific destinations take precedence (100).
         let priority = if route.pattern == "dtn://**"
             || route.pattern == "dtn:**"
             || route.pattern == "ipn://**"
             || route.pattern == "ipn:**"
             || route.pattern == "*:**"
         {
-            10
+            200
         } else {
             100
         };
@@ -244,5 +244,32 @@ impl RoutingAgent for RouteManager {
     async fn on_unregister(&self) {
         info!("HamRoutingAgent unregistered from Hardy BPA");
         *self.sink.write().await = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_route_specific_beats_wildcard_priority() {
+        let wildcard = RouteConfig {
+            pattern: "dtn:**".to_string(),
+            cla: "tcpcl".to_string(),
+            next_hop: Some("dtn://hub/".to_string()),
+            action: None,
+        };
+        let specific = RouteConfig {
+            pattern: "dtn://peer1/**".to_string(),
+            cla: "tcpcl".to_string(),
+            next_hop: Some("dtn://peer1/".to_string()),
+            action: None,
+        };
+
+        let (_, _, wildcard_prio) = RouteManager::parse_route(&wildcard).unwrap();
+        let (_, _, specific_prio) = RouteManager::parse_route(&specific).unwrap();
+        assert_eq!(specific_prio, 100);
+        assert_eq!(wildcard_prio, 200);
+        assert!(specific_prio < wildcard_prio);
     }
 }

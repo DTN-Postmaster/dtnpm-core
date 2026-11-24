@@ -2,7 +2,38 @@
 
 use core::num::NonZeroU64;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
+
+/// Returns the automatic canonical APRS transport alias for a CLA protocol type
+/// (e.g. `"tcpclv4"` -> `"TCPCL"`, `"ltp"` -> `"LTP"`).
+#[must_use]
+pub fn auto_cla_transport_alias(cla_type: &str) -> Option<&'static str> {
+    match cla_type.trim().to_ascii_lowercase().as_str() {
+        "tcpclv4" | "tcpcl" => Some("TCPCL"),
+        "ltp" => Some("LTP"),
+        "hqfbp" => Some("HQFBP"),
+        "mercury-arq" | "mercury" => Some("MERCURY"),
+        _ => None,
+    }
+}
+
+/// Computes the canonical, sorted, deduplicated uppercase alias list for a CLA,
+/// combining the automatic transport tag for `cla_type` with explicit `configured` aliases.
+#[must_use]
+pub fn canonical_cla_aliases(cla_type: &str, configured: &[String]) -> Vec<String> {
+    let mut set = BTreeSet::new();
+    if let Some(auto_alias) = auto_cla_transport_alias(cla_type) {
+        set.insert(auto_alias.to_string());
+    }
+    for raw in configured {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            set.insert(trimmed.to_ascii_uppercase());
+        }
+    }
+    set.into_iter().collect()
+}
 
 /// CLA entry in configuration file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +49,18 @@ pub struct ClaConfig {
     /// Optional contact schedule for this CLA.
     #[serde(default)]
     pub schedule: Option<ScheduleConfig>,
+    /// Optional APRS-style CLA/band aliases (e.g. `["VHF", "2M"]`, `["QO100"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+}
+
+impl ClaConfig {
+    /// Returns the effective canonical uppercase aliases for this CLA
+    /// (automatic transport tag plus configured `aliases`).
+    #[must_use]
+    pub fn effective_aliases(&self) -> Vec<String> {
+        canonical_cla_aliases(self.cla_type.type_name(), &self.aliases)
+    }
 }
 
 /// Supported CLA protocol engines.

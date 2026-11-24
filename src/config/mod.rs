@@ -625,6 +625,18 @@ pub struct RegoRoutingYamlConfig {
     /// Inline override for `routing.rego` (`package dtn.routing`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_routing_rego: Option<String>,
+
+    /// Enable recording Traceroute Extension Block (TREB) hops on transit bundles (default `false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_treb: Option<bool>,
+
+    /// Additional node-level APRS aliases supported by this station.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_aliases: Vec<String>,
+
+    /// APRS aliases explicitly trapped/dropped at ingress.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trapped_aliases: Vec<String>,
 }
 
 /// SenML telemetry configuration block.
@@ -961,5 +973,30 @@ key_path = "/etc/dtnpm/key.pem"
         assert_eq!(cfg.grpc.auth.tokens.len(), 1);
         assert_eq!(cfg.grpc.auth.tokens[0].role, "Admin");
         assert!(cfg.tls.enabled);
+    }
+
+    #[test]
+    fn test_cla_aliases_and_rego_routing_config_parsing() {
+        let yaml = r#"
+node-id: "dtn://f4jxq/"
+rego-routing:
+  policy-dir: "/etc/dtnpm/policies"
+  record-treb: true
+  supported-aliases: ["QO100"]
+  trapped-aliases: ["WIDE3"]
+clas:
+  - name: "vhf-kiss"
+    type: hqfbp
+    aliases: ["vhf", "2m", "VHF"]
+  - name: "tcp-main"
+    type: tcpclv4
+"#;
+        let cfg: HamConfig = yaml_serde::from_str(yaml).unwrap();
+        let rego = cfg.rego_routing.as_ref().unwrap();
+        assert_eq!(rego.record_treb, Some(true));
+        assert_eq!(rego.supported_aliases, vec!["QO100"]);
+        assert_eq!(rego.trapped_aliases, vec!["WIDE3"]);
+        assert_eq!(cfg.clas[0].effective_aliases(), vec!["2M", "HQFBP", "VHF"]);
+        assert_eq!(cfg.clas[1].effective_aliases(), vec!["TCPCL"]);
     }
 }
