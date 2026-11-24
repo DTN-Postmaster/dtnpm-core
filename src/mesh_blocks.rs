@@ -88,7 +88,8 @@ pub struct StrictTarget {
     pub completed: bool,
 }
 
-/// Scoped alias hop inside APRS trajectory control (e.g., `WIDE1-1`, `WIDE2-2`).
+/// Scoped alias hop inside APRS trajectory control using the New n-N Paradigm
+/// (e.g., `VHF2-2`, `10M2-1`, `ARES2-2`, `QO100-1-1`, `WIDE1-1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopedAlias {
     pub scope_name: String,
@@ -978,10 +979,14 @@ impl RoutingExtensionsSummary {
 
 /// Parses a comma-separated APRS-like path specification into [`PathElement`] items.
 ///
-/// Examples:
-/// - `"WIDE1-1,WIDE2-2"` -> two `ScopedAlias` hops (`WIDE1` 1/1, `WIDE2` 2/2)
-/// - `"dtn://relay1/,WIDE2-2"` -> `StrictTarget("dtn://relay1/")`, `ScopedAlias("WIDE2", 2/2)`
-/// - `"ipn:42.0,RELAY"` -> two `StrictTarget` hops
+/// Only the **New n-N Paradigm** (`1 <= N <= n <= 7`) is recognized as a [`ScopedAlias`]:
+/// - Standard New n-N: `<SCOPE><n>-<N>` where `<SCOPE>` ends with `[A-Za-z]`
+///   (e.g., `VHF2-2`, `TCPCL1-1`, `10M2-1`, `ARES2-2`, `WIDE1-1`, `WIDE2-2`).
+/// - Hyphenated New n-N (for digit-ending scopes): `<SCOPE>-<n>-<N>`
+///   (e.g., `QO100-1-1`, `2G4-2-2`).
+///
+/// Callsigns with SSIDs (e.g., `F4JXQ-9`, `N0CALL-15`), legacy non-n-N tokens (`VHF-2`),
+/// and explicit URIs (`dtn://relay1/`, `ipn:42.0`) parse as [`StrictTarget`] hops.
 pub fn parse_aprs_path(spec: &str) -> Result<Vec<PathElement>, MeshBlockError> {
     let mut elements = Vec::new();
     for raw_hop in spec.split(',') {
@@ -996,25 +1001,76 @@ pub fn parse_aprs_path(spec: &str) -> Result<Vec<PathElement>, MeshBlockError> {
             }));
             continue;
         }
-        if let Some((scope, count_str)) = hop.rsplit_once('-')
-            && !scope.is_empty()
-            && scope.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            && let Ok(count) = count_str.parse::<u32>()
-        {
-            if count == 0 {
-                return Err(MeshBlockError::InvalidInput(format!(
-                    "APRS alias '{hop}' must have a hop count >= 1"
-                )));
+
+        let parts: Vec<&str> = hop.split('-').collect();
+        if parts.len() == 2 {
+            let (left, right) = (parts[0], parts[1]);
+            let left_bytes = left.as_bytes();
+            if left_bytes.len() >= 2
+                && left.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && let Some(&n_byte) = left_bytes.last()
+                && n_byte.is_ascii_digit()
+                && let Some(&prev_byte) = left_bytes.get(left_bytes.len() - 2)
+                && prev_byte.is_ascii_alphabetic()
+                && !right.is_empty()
+                && right.chars().all(|c| c.is_ascii_digit())
+            {
+                let n = u32::from(n_byte - b'0');
+                let remaining = right.parse::<u32>().map_err(|_| {
+                    MeshBlockError::InvalidInput(format!(
+                        "APRS New n-N alias '{hop}' has invalid remaining hop count"
+                    ))
+                })?;
+                if !(1..=7).contains(&n) || remaining == 0 || remaining > n {
+                    return Err(MeshBlockError::InvalidInput(format!(
+                        "APRS New n-N alias '{hop}' must satisfy 1 <= N <= n <= 7"
+                    )));
+                }
+                let scope = &left[..left.len() - 1];
+                elements.push(PathElement::Alias(ScopedAlias {
+                    scope_name: scope.to_ascii_uppercase(),
+                    max_count: n,
+                    remaining_count: remaining,
+                    completed: false,
+                    serviced_by: None,
+                }));
+                continue;
             }
-            elements.push(PathElement::Alias(ScopedAlias {
-                scope_name: scope.to_ascii_uppercase(),
-                max_count: count,
-                remaining_count: count,
-                completed: false,
-                serviced_by: None,
-            }));
-            continue;
+        } else if parts.len() == 3 {
+            let (scope, n_str, rem_str) = (parts[0], parts[1], parts[2]);
+            if !scope.is_empty()
+                && scope.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !n_str.is_empty()
+                && n_str.chars().all(|c| c.is_ascii_digit())
+                && !rem_str.is_empty()
+                && rem_str.chars().all(|c| c.is_ascii_digit())
+            {
+                let n = n_str.parse::<u32>().map_err(|_| {
+                    MeshBlockError::InvalidInput(format!(
+                        "APRS New n-N alias '{hop}' has invalid max hop count"
+                    ))
+                })?;
+                let remaining = rem_str.parse::<u32>().map_err(|_| {
+                    MeshBlockError::InvalidInput(format!(
+                        "APRS New n-N alias '{hop}' has invalid remaining hop count"
+                    ))
+                })?;
+                if !(1..=7).contains(&n) || remaining == 0 || remaining > n {
+                    return Err(MeshBlockError::InvalidInput(format!(
+                        "APRS New n-N alias '{hop}' must satisfy 1 <= N <= n <= 7"
+                    )));
+                }
+                elements.push(PathElement::Alias(ScopedAlias {
+                    scope_name: scope.to_ascii_uppercase(),
+                    max_count: n,
+                    remaining_count: remaining,
+                    completed: false,
+                    serviced_by: None,
+                }));
+                continue;
+            }
         }
+
         elements.push(PathElement::Strict(StrictTarget {
             target_id: hop.to_string(),
             completed: false,
@@ -1028,7 +1084,7 @@ pub fn parse_aprs_path(spec: &str) -> Result<Vec<PathElement>, MeshBlockError> {
     Ok(elements)
 }
 
-/// Formats a [`TrajectoryControl`] path into a concise human-readable APRS-like string.
+/// Formats a [`TrajectoryControl`] path into a concise human-readable APRS New n-N string.
 #[must_use]
 pub fn format_aprs_path(elements: &[PathElement]) -> String {
     elements
@@ -1042,7 +1098,16 @@ pub fn format_aprs_path(elements: &[PathElement]) -> String {
                 }
             }
             PathElement::Alias(a) => {
-                let base = format!("{}-{}", a.scope_name, a.remaining_count);
+                let base = if a
+                    .scope_name
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_digit)
+                {
+                    format!("{}-{}-{}", a.scope_name, a.max_count, a.remaining_count)
+                } else {
+                    format!("{}{}-{}", a.scope_name, a.max_count, a.remaining_count)
+                };
                 if a.completed {
                     if let Some(ref sb) = a.serviced_by {
                         format!("{base}*({sb})")
@@ -1194,16 +1259,58 @@ mod tests {
 
     #[test]
     fn parse_and_format_aprs_path_roundtrip() {
-        let parsed = parse_aprs_path("WIDE1-1, dtn://relay1/, WIDE2-2")
-            .expect("valid APRS path should parse");
-        assert_eq!(parsed.len(), 3);
-        assert_eq!(format_aprs_path(&parsed), "WIDE1-1,dtn://relay1/,WIDE2-2");
+        let parsed = parse_aprs_path("VHF2-2, dtn://relay1/, ARES2-1, QO100-1-1, 2G4-2-2, 10m2-2")
+            .expect("valid New n-N APRS path should parse");
+        assert_eq!(parsed.len(), 6);
+        assert_eq!(
+            parsed[0],
+            PathElement::Alias(ScopedAlias {
+                scope_name: "VHF".to_string(),
+                max_count: 2,
+                remaining_count: 2,
+                completed: false,
+                serviced_by: None,
+            })
+        );
+        assert_eq!(
+            parsed[3],
+            PathElement::Alias(ScopedAlias {
+                scope_name: "QO100".to_string(),
+                max_count: 1,
+                remaining_count: 1,
+                completed: false,
+                serviced_by: None,
+            })
+        );
+        assert_eq!(
+            format_aprs_path(&parsed),
+            "VHF2-2,dtn://relay1/,ARES2-1,QO100-1-1,2G4-2-2,10M2-2"
+        );
     }
 
     #[test]
-    fn parse_aprs_path_rejects_empty_or_zero_count() {
+    fn parse_aprs_path_avoids_ssid_confusion_and_rejects_invalid_nn() {
+        // Callsigns with SSIDs, trailing underscores, and legacy non-n-N tokens must be strict targets, never aliases.
+        let strict_only = parse_aprs_path("F4JXQ-9, F4JXQ-1, N0CALL-15, VHF-2, ARES-2, QO100_1-1")
+            .expect("callsigns with SSIDs should parse as strict targets");
+        assert_eq!(strict_only.len(), 6);
+        for elem in &strict_only {
+            assert!(
+                matches!(elem, PathElement::Strict(_)),
+                "expected StrictTarget, got {elem:?}"
+            );
+        }
+
+        // Empty or invalid New n-N bounds (1 <= N <= n <= 7) must be rejected.
         assert!(parse_aprs_path("   ").is_err());
         assert!(parse_aprs_path("WIDE1-0").is_err());
+        assert!(parse_aprs_path("VHF2-0").is_err());
+        assert!(parse_aprs_path("VHF2-3").is_err());
+        assert!(parse_aprs_path("VHF0-0").is_err());
+        assert!(parse_aprs_path("VHF8-8").is_err());
+        assert!(parse_aprs_path("QO100-2-0").is_err());
+        assert!(parse_aprs_path("QO100-2-3").is_err());
+        assert!(parse_aprs_path("QO100-8-1").is_err());
     }
 
     #[test]
