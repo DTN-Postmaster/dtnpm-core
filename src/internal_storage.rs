@@ -2684,10 +2684,9 @@ mod tests {
 
             // Progress chat status: received -> forwarded -> delivered, reject invalid & downgrade
             assert!(
-                storage
+                !storage
                     .update_chat_delivery_status("missing-id", "received", 0, 100)
                     .unwrap()
-                    == false
             );
             assert!(
                 storage
