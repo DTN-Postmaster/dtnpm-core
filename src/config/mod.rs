@@ -1105,4 +1105,40 @@ outbox = "/tmp/ext/outbox"
             );
         }
     }
+
+    #[test]
+    fn test_cla_type_case_insensitive_deserialization_and_parse_as() {
+        let yaml = r#"
+node-id: "dtn://f4case/"
+clas:
+  - name: "tcp-upper"
+    type: TCPCLV4
+    require-tls: false
+  - name: "mercury-upper"
+    type: MERCURY-ARQ
+    my-callsign: "F4CASE"
+  - name: "ltp-upper"
+    type: LTP
+    engine-id: 7
+  - name: "file-upper"
+    type: FILE-CLA
+    outbox: "/tmp/upper/outbox"
+"#;
+        let cfg: HamConfig = yaml_serde::from_str(yaml).unwrap();
+        assert_eq!(cfg.clas.len(), 4);
+        assert!(matches!(cfg.clas[0].cla_type, cla::ClaType::TcpClv4(_)));
+        assert!(matches!(cfg.clas[1].cla_type, cla::ClaType::MercuryArq(_)));
+        assert_eq!(cfg.clas[0].effective_aliases(), vec!["TCPCL"]);
+        assert_eq!(cfg.clas[1].effective_aliases(), vec!["MERCURY"]);
+        assert_eq!(cfg.clas[2].effective_aliases(), vec!["LTP"]);
+        assert_eq!(cfg.clas[3].effective_aliases(), vec!["FILE"]);
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct DummyLtp {
+            engine_id: u64,
+        }
+        let parsed: DummyLtp = cfg.clas[2].cla_type.parse_as("ltp").unwrap().unwrap();
+        assert_eq!(parsed.engine_id, 7);
+    }
 }

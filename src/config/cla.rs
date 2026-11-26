@@ -117,7 +117,9 @@ impl ClaType {
         expected_type: &str,
     ) -> Result<Option<T>, serde_json::Error> {
         match self {
-            Self::Other { cla_type, config } if cla_type == expected_type => {
+            Self::Other { cla_type, config }
+                if cla_type.trim().eq_ignore_ascii_case(expected_type.trim()) =>
+            {
                 serde_json::from_value(config.clone()).map(Some)
             }
             _ => Ok(None),
@@ -157,7 +159,7 @@ impl<'de> Deserialize<'de> for ClaType {
             .remove("type")
             .and_then(|v| v.as_str().map(str::to_string))
             .ok_or_else(|| serde::de::Error::missing_field("type"))?;
-        match raw_type.as_str() {
+        match raw_type.trim().to_ascii_lowercase().as_str() {
             "tcpclv4" | "tcpcl" => serde_json::from_value(serde_json::Value::Object(map))
                 .map(Self::TcpClv4)
                 .map_err(serde::de::Error::custom),
