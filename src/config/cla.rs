@@ -5,8 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 
+/// Canonical automatic APRS transport aliases for all built-in CLA families.
+pub const BUILTIN_CLA_TRANSPORT_ALIASES: &[&str] = &["TCPCL", "LTP", "HQFBP", "MERCURY", "FILE"];
+
 /// Returns the automatic canonical APRS transport alias for a CLA protocol type
-/// (e.g. `"tcpclv4"` -> `"TCPCL"`, `"ltp"` -> `"LTP"`).
+/// (e.g. `"tcpclv4"` -> `"TCPCL"`, `"ltp"` -> `"LTP"`, `"file-cla"` -> `"FILE"`).
 #[must_use]
 pub fn auto_cla_transport_alias(cla_type: &str) -> Option<&'static str> {
     match cla_type.trim().to_ascii_lowercase().as_str() {
@@ -14,6 +17,7 @@ pub fn auto_cla_transport_alias(cla_type: &str) -> Option<&'static str> {
         "ltp" => Some("LTP"),
         "hqfbp" => Some("HQFBP"),
         "mercury-arq" | "mercury" => Some("MERCURY"),
+        "file-cla" | "file" => Some("FILE"),
         _ => None,
     }
 }
@@ -66,9 +70,9 @@ impl ClaConfig {
 /// Supported CLA protocol engines.
 ///
 /// Built-in node-level/core variants (`tcpclv4`, `mercury-arq`) have typed
-/// configurations here, while external plugin CLAs (such as `ltp`, `hqfbp`, or
-/// future hardware adapters) deserialize into [`ClaType::Other`] without creating
-/// cyclic dependencies on external CLA crates.
+/// configurations here, while external/extension CLAs (such as `ltp`, `hqfbp`,
+/// `file-cla`, or future hardware adapters) deserialize into [`ClaType::Other`]
+/// without creating cyclic dependencies on external CLA crates.
 #[derive(Debug, Clone)]
 pub enum ClaType {
     /// TCPCL v4 convergence layer (RFC 9174).

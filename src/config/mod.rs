@@ -43,7 +43,7 @@ pub struct HamConfig {
     /// Web dashboard and REST API server settings (optional).
     pub web: Option<WebConfig>,
 
-    /// Configured Convergence Layer Adapters (TCPCLv4, LTP, HQFBP).
+    /// Configured Convergence Layer Adapters (TCPCLv4, LTP, HQFBP, Mercury ARQ, File CLA).
     pub clas: Vec<cla::ClaConfig>,
 
     /// Static routing definitions.
@@ -1044,5 +1044,65 @@ clas:
         assert_eq!(rego.ansrvr.max_groups, 64);
         assert_eq!(cfg.clas[0].effective_aliases(), vec!["2M", "HQFBP", "VHF"]);
         assert_eq!(cfg.clas[1].effective_aliases(), vec!["TCPCL"]);
+    }
+
+    #[test]
+    fn test_multiple_file_clas_config_and_aliases() {
+        let yaml = r#"
+node-id: "dtn://f4jxq/"
+clas:
+  - name: "usb-club"
+    type: file-cla
+    aliases: ["usb"]
+    outbox: "/tmp/usb/outbox"
+    peers:
+      "dtn://f4usb/": "/tmp/usb/inbox"
+  - name: "ext-bridge"
+    type: file
+    aliases: ["ext"]
+    outbox: "/tmp/ext/outbox"
+    peers:
+      "dtn://f4ext/": "/tmp/ext/inbox"
+"#;
+        let cfg_yaml: HamConfig = yaml_serde::from_str(yaml).unwrap();
+        assert_eq!(cfg_yaml.clas.len(), 2);
+        assert_eq!(cfg_yaml.clas[0].cla_type.type_name(), "file-cla");
+        assert_eq!(cfg_yaml.clas[1].cla_type.type_name(), "file");
+        assert_eq!(cfg_yaml.clas[0].effective_aliases(), vec!["FILE", "USB"]);
+        assert_eq!(cfg_yaml.clas[1].effective_aliases(), vec!["EXT", "FILE"]);
+
+        let toml_str = r#"
+node-id = "dtn://f4jxq/"
+
+[[clas]]
+name = "usb-club"
+type = "file-cla"
+aliases = ["usb"]
+outbox = "/tmp/usb/outbox"
+
+[clas.peers]
+"dtn://f4usb/" = "/tmp/usb/inbox"
+
+[[clas]]
+name = "ext-bridge"
+type = "file"
+aliases = ["ext"]
+outbox = "/tmp/ext/outbox"
+
+[clas.peers]
+"dtn://f4ext/" = "/tmp/ext/inbox"
+"#;
+        let cfg_toml: HamConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg_toml.clas.len(), 2);
+        assert_eq!(cfg_toml.clas[0].effective_aliases(), vec!["FILE", "USB"]);
+        assert_eq!(cfg_toml.clas[1].effective_aliases(), vec!["EXT", "FILE"]);
+
+        for cla_type in ["tcpclv4", "ltp", "hqfbp", "mercury-arq", "file-cla"] {
+            let alias = cla::auto_cla_transport_alias(cla_type).unwrap();
+            assert!(
+                cla::BUILTIN_CLA_TRANSPORT_ALIASES.contains(&alias),
+                "alias '{alias}' for '{cla_type}' missing from BUILTIN_CLA_TRANSPORT_ALIASES"
+            );
+        }
     }
 }
