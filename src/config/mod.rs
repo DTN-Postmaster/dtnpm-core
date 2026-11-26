@@ -1091,11 +1091,28 @@ outbox = "/tmp/ext/outbox"
 
 [clas.peers]
 "dtn://f4ext/" = "/tmp/ext/inbox"
+"ipn:42.0" = "/tmp/ipn42/inbox"
 "#;
         let cfg_toml: HamConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg_toml.clas.len(), 2);
         assert_eq!(cfg_toml.clas[0].effective_aliases(), vec!["FILE", "USB"]);
         assert_eq!(cfg_toml.clas[1].effective_aliases(), vec!["EXT", "FILE"]);
+
+        let cfg_toml_builder: HamConfig = config::Config::builder()
+            .add_source(config::File::from_str(toml_str, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(cfg_toml_builder.clas.len(), 2);
+        assert_eq!(
+            cfg_toml_builder.clas[0].effective_aliases(),
+            vec!["FILE", "USB"]
+        );
+        assert_eq!(
+            cfg_toml_builder.clas[1].effective_aliases(),
+            vec!["EXT", "FILE"]
+        );
 
         for cla_type in ["tcpclv4", "ltp", "hqfbp", "mercury-arq", "file-cla"] {
             let alias = cla::auto_cla_transport_alias(cla_type).unwrap();
