@@ -119,8 +119,10 @@ impl Sink for ObservedClaSink {
 
     async fn add_peer(&self, cla_addr: ClaAddress, node_ids: &[NodeId]) -> ClaResult<bool> {
         let added = self.inner.add_peer(cla_addr.clone(), node_ids).await?;
-        self.observer
-            .on_peer_up(&self.cla_name, &self.cla_type, &cla_addr, node_ids);
+        if added {
+            self.observer
+                .on_peer_up(&self.cla_name, &self.cla_type, &cla_addr, node_ids);
+        }
         Ok(added)
     }
 
@@ -136,5 +138,103 @@ impl Sink for ObservedClaSink {
         outcome: hardy_bpa::cla::TransferOutcome,
     ) -> ClaResult<()> {
         self.inner.transfer_outcome(bundle_id, outcome).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct MockSink {
+        accept_peer: bool,
+    }
+
+    #[async_trait]
+    impl Sink for MockSink {
+        async fn unregister(&self) {}
+
+        async fn dispatch(
+            &self,
+            _peer_node: Option<&NodeId>,
+            _peer_addr: Option<&ClaAddress>,
+            _stream: &mut dyn Receiver<Segment>,
+        ) -> ClaResult<Acceptance> {
+            Ok(Acceptance::Accepted)
+        }
+
+        async fn add_peer(&self, _cla_addr: ClaAddress, _node_ids: &[NodeId]) -> ClaResult<bool> {
+            Ok(self.accept_peer)
+        }
+
+        async fn remove_peer(&self, _cla_addr: &ClaAddress) -> ClaResult<bool> {
+            Ok(true)
+        }
+
+        async fn transfer_outcome(
+            &self,
+            _bundle_id: &Id,
+            _outcome: hardy_bpa::cla::TransferOutcome,
+        ) -> ClaResult<()> {
+            Ok(())
+        }
+    }
+
+    struct CountingObserver {
+        peer_up_calls: AtomicUsize,
+    }
+
+    impl PeerObserver for CountingObserver {
+        fn on_peer_up(
+            &self,
+            _cla_name: &str,
+            _cla_type: &str,
+            _addr: &ClaAddress,
+            _node_ids: &[NodeId],
+        ) {
+            self.peer_up_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn on_peer_down(&self, _cla_name: &str, _addr: &ClaAddress) {}
+    }
+
+    #[tokio::test]
+    async fn add_peer_notifies_observer_only_when_accepted() {
+        let addr = ClaAddress::Private(hardy_bpa::Bytes::from_static(b"/tmp/inbox"));
+        let node_id: NodeId = "dtn://peer/".parse().unwrap();
+
+        let observer_rejected = Arc::new(CountingObserver {
+            peer_up_calls: AtomicUsize::new(0),
+        });
+        let sink_rejected = ObservedClaSink {
+            cla_name: "file-1".to_string(),
+            cla_type: "file-cla".to_string(),
+            inner: Box::new(MockSink { accept_peer: false }),
+            observer: observer_rejected.clone(),
+        };
+        assert!(
+            !sink_rejected
+                .add_peer(addr.clone(), std::slice::from_ref(&node_id))
+                .await
+                .unwrap()
+        );
+        assert_eq!(observer_rejected.peer_up_calls.load(Ordering::SeqCst), 0);
+
+        let observer_accepted = Arc::new(CountingObserver {
+            peer_up_calls: AtomicUsize::new(0),
+        });
+        let sink_accepted = ObservedClaSink {
+            cla_name: "file-1".to_string(),
+            cla_type: "file-cla".to_string(),
+            inner: Box::new(MockSink { accept_peer: true }),
+            observer: observer_accepted.clone(),
+        };
+        assert!(
+            sink_accepted
+                .add_peer(addr, std::slice::from_ref(&node_id))
+                .await
+                .unwrap()
+        );
+        assert_eq!(observer_accepted.peer_up_calls.load(Ordering::SeqCst), 1);
     }
 }
