@@ -55,6 +55,9 @@ pub const BLOCK_TYPE_MESH_ROUTING: u64 = 200;
 /// Default experimental block type for TREB (`draft-koo-dtn-traceroute-eb`).
 pub const DEFAULT_BLOCK_TYPE_TREB: u64 = 201;
 
+/// Maximum number of reversed strict hops derived for automatic traceback replies.
+pub const MAX_RETURN_TRAJECTORY_HOPS: usize = 16;
+
 /// Maximum CBOR recursion depth when converting custom extension blocks into JSON.
 const MAX_CBOR_DEPTH: usize = 32;
 
@@ -1208,6 +1211,280 @@ pub fn apply_routing_extensions<'a>(
     Ok(builder)
 }
 
+/// Attaches an empty TREB (`draft-koo-dtn-traceroute-eb`, Block Type 201) so
+/// transit nodes record their visited node EIDs even when `record_treb` is
+/// disabled globally.
+pub fn attach_empty_treb<'a>(builder: Builder<'a>) -> anyhow::Result<Builder<'a>> {
+    let encoded = TrebData::default().encode_cbor()?;
+    let builder = builder
+        .add_extension_block(block::Type::Unrecognised(DEFAULT_BLOCK_TYPE_TREB))
+        .map_err(|e| anyhow::anyhow!("Failed to add TREB block (201): {e}"))?
+        .with_flags(block::Flags {
+            must_replicate: true,
+            ..Default::default()
+        })
+        .build(encoded.into_vec().into());
+    Ok(builder)
+}
+
+/// Attaches a pre-built [`TrajectoryControl`] onto a Hardy BPv7 [`Builder`] as
+/// Mesh Routing Block Type 200.
+pub fn apply_return_trajectory<'a>(
+    builder: Builder<'a>,
+    trajectory: TrajectoryControl,
+) -> anyhow::Result<Builder<'a>> {
+    let mesh = MeshRoutingData {
+        trajectory_control: Some(trajectory),
+        ..Default::default()
+    };
+    let encoded = mesh.encode_cbor()?;
+    let builder = builder
+        .add_extension_block(block::Type::Unrecognised(BLOCK_TYPE_MESH_ROUTING))
+        .map_err(|e| anyhow::anyhow!("Failed to add Mesh Routing block (200): {e}"))?
+        .with_flags(block::Flags {
+            must_replicate: true,
+            ..Default::default()
+        })
+        .build(encoded.into_vec().into());
+    Ok(builder)
+}
+
+/// Maximum length accepted for a bare callsign/node token when canonicalizing return hops.
+const MAX_RETURN_HOP_LEN: usize = 128;
+
+/// Derived return-path routing metadata from an incoming request bundle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplyRoutingPlan {
+    /// Reversed strict APRS trajectory to attach to the reply, if any intermediate relays exist.
+    pub return_trajectory: Option<TrajectoryControl>,
+    /// Whether the incoming request carried TREB (Block 201), so the reply should seed a fresh empty TREB.
+    pub seed_treb: bool,
+}
+
+/// Validates and canonicalizes a candidate return hop into a strict node EID
+/// (`dtn://<node>/` or `ipn:<fqnn>.0`), rejecting commas, whitespace, control
+/// characters, and leading-dash tokens to prevent APRS alias injection or CLI flag confusion.
+fn canonicalize_return_hop(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_RETURN_HOP_LEN
+        || trimmed
+            .chars()
+            .any(|c| c == ',' || c.is_whitespace() || c.is_ascii_control())
+    {
+        return None;
+    }
+    if let Ok(eid) = trimmed.parse::<hardy_bpv7::eid::Eid>() {
+        return match eid {
+            hardy_bpv7::eid::Eid::Dtn { node_name, .. } => {
+                let name = node_name.node_name.as_ref();
+                if name.is_empty()
+                    || name
+                        .chars()
+                        .any(|c| c == ',' || c.is_whitespace() || c.is_ascii_control())
+                {
+                    return None;
+                }
+                Some(format!("dtn://{}/", name.to_ascii_lowercase()))
+            }
+            hardy_bpv7::eid::Eid::Ipn { fqnn, .. } => Some(if fqnn.allocator_id == 0 {
+                format!("ipn:{}.0", fqnn.node_number)
+            } else {
+                format!("ipn:{}.{}.0", fqnn.allocator_id, fqnn.node_number)
+            }),
+            _ => None,
+        };
+    }
+
+    let mut chars = trimmed.chars();
+    let first = chars.next()?;
+    if trimmed.len() > 64
+        || !first.is_ascii_alphanumeric()
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(format!("dtn://{}/", trimmed.to_ascii_lowercase()))
+}
+
+fn filter_relay_candidates<I>(
+    candidates: I,
+    local_key: Option<&str>,
+    dest_key: Option<&str>,
+) -> Vec<PathElement>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut seen_keys: Vec<String> = Vec::new();
+    let mut path_elements: Vec<PathElement> = Vec::new();
+    for raw_hop in candidates {
+        let Some(canonical) = canonicalize_return_hop(&raw_hop) else {
+            continue;
+        };
+        if local_key == Some(canonical.as_str()) || dest_key == Some(canonical.as_str()) {
+            continue;
+        }
+        if seen_keys.contains(&canonical) {
+            continue;
+        }
+        seen_keys.push(canonical.clone());
+        path_elements.push(PathElement::Strict(StrictTarget {
+            target_id: canonical,
+            completed: false,
+        }));
+        if path_elements.len() >= MAX_RETURN_TRAJECTORY_HOPS {
+            break;
+        }
+    }
+    path_elements
+}
+
+/// Derives a [`ReplyRoutingPlan`] from an already-decoded [`RoutingExtensionsSummary`],
+/// avoiding redundant CBOR parsing when the caller also inspects extension blocks.
+#[must_use]
+pub fn derive_reply_routing_from_summary(
+    bundle: &Bundle,
+    raw_bundle: &[u8],
+    ext: &RoutingExtensionsSummary,
+    local_node: &hardy_bpv7::eid::Eid,
+) -> ReplyRoutingPlan {
+    let local_key = canonicalize_return_hop(&local_node.to_string());
+    let dest_key = canonicalize_return_hop(&bundle.primary.id.source.to_string());
+    let seed_treb = ext.treb.is_some();
+
+    let mut path_elements = if let Some(ref treb) = ext.treb {
+        filter_relay_candidates(
+            treb.hops.iter().rev().map(|h| h.node_eid.clone()),
+            local_key.as_deref(),
+            dest_key.as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
+
+    if path_elements.is_empty()
+        && let Some(ref mesh) = ext.mesh_routing
+        && let Some(ref traj) = mesh.trajectory_control
+    {
+        let aprs_candidates = traj
+            .path_elements
+            .iter()
+            .rev()
+            .filter_map(|elem| match elem {
+                PathElement::Strict(s) if s.completed => Some(s.target_id.clone()),
+                PathElement::Alias(a) => a.serviced_by.clone(),
+                _ => None,
+            });
+        path_elements =
+            filter_relay_candidates(aprs_candidates, local_key.as_deref(), dest_key.as_deref());
+    }
+
+    if path_elements.is_empty() {
+        let mut prev_candidates = Vec::new();
+        for blk in bundle.blocks.values() {
+            if blk.block_type == block::Type::PreviousNode
+                && let Some(payload) = blk.payload(raw_bundle)
+                && let Ok(prev_eid) = hardy_cbor::decode::parse::<hardy_bpv7::eid::Eid>(payload)
+            {
+                prev_candidates.push(prev_eid.to_string());
+                break;
+            }
+        }
+        path_elements =
+            filter_relay_candidates(prev_candidates, local_key.as_deref(), dest_key.as_deref());
+    }
+
+    let return_trajectory = if path_elements.is_empty() {
+        None
+    } else {
+        Some(TrajectoryControl {
+            path_elements,
+            active_hop_index: 0,
+            allow_substitution: Some(true),
+        })
+    };
+
+    ReplyRoutingPlan {
+        return_trajectory,
+        seed_treb,
+    }
+}
+
+/// Derives a [`ReplyRoutingPlan`] (reversed strict APRS return trajectory plus
+/// fresh-TREB flag) from a received request bundle in a single CBOR decode pass.
+#[must_use]
+pub fn derive_reply_routing(
+    bundle: &Bundle,
+    raw_bundle: &[u8],
+    local_node: &hardy_bpv7::eid::Eid,
+) -> ReplyRoutingPlan {
+    let ext = extract_routing_extensions(bundle, raw_bundle);
+    derive_reply_routing_from_summary(bundle, raw_bundle, &ext, local_node)
+}
+
+/// Applies a [`ReplyRoutingPlan`] onto a Hardy BPv7 [`Builder`] (Block 200
+/// return trajectory and/or fresh empty Block 201 TREB).
+pub fn apply_reply_routing<'a>(
+    mut builder: Builder<'a>,
+    plan: &ReplyRoutingPlan,
+) -> anyhow::Result<Builder<'a>> {
+    if let Some(ref traj) = plan.return_trajectory {
+        builder = apply_return_trajectory(builder, traj.clone())?;
+    }
+    if plan.seed_treb {
+        builder = attach_empty_treb(builder)?;
+    }
+    Ok(builder)
+}
+
+/// Validates routing CLI/config parameters (`hop_limit`, `aprs_path`, `spray_quota`)
+/// up front without constructing a real bundle.
+pub fn validate_routing_extensions(
+    hop_limit: Option<u8>,
+    aprs_path: Option<&str>,
+    spray_quota: Option<u32>,
+) -> anyhow::Result<()> {
+    apply_routing_extensions(
+        Builder::new(hardy_bpv7::eid::Eid::Null, hardy_bpv7::eid::Eid::Null),
+        hop_limit,
+        aprs_path,
+        spray_quota,
+    )?;
+    Ok(())
+}
+
+/// Returns `true` when an outgoing CLI bundle should seed an empty TREB (Block 201),
+/// ignoring empty/whitespace-only `--aprs-path` strings.
+#[must_use]
+pub fn should_auto_seed_treb(
+    record_route: bool,
+    aprs_path: Option<&str>,
+    spray_quota: Option<u32>,
+) -> bool {
+    record_route || spray_quota.is_some() || aprs_path.is_some_and(|p| !p.trim().is_empty())
+}
+
+/// Derives a reversed strict APRS [`TrajectoryControl`] return path from a
+/// received request bundle so services (e.g. Echo) can reply along the exact
+/// reverse path without static routes.
+///
+/// Priority:
+/// 1. TREB (Block Type 201) visited hops, reversed.
+/// 2. Completed hops in Mesh Routing Block Type 200 (`TrajectoryControl`), reversed.
+/// 3. Previous Node Block (Block Type 6), single-hop fallback.
+///
+/// Strips `local_node` and `bundle.primary.id.source` (the reply destination),
+/// canonicalizes and deduplicates relays in reverse order, and caps at
+/// [`MAX_RETURN_TRAJECTORY_HOPS`].
+#[must_use]
+pub fn derive_return_trajectory(
+    bundle: &Bundle,
+    raw_bundle: &[u8],
+    local_node: &hardy_bpv7::eid::Eid,
+) -> Option<TrajectoryControl> {
+    derive_reply_routing(bundle, raw_bundle, local_node).return_trajectory
+}
+
 /// Extracts and decodes routing extension blocks (Types 10, 194, 200, 201) from a parsed BPv7 bundle.
 #[must_use]
 pub fn extract_routing_extensions(bundle: &Bundle, raw_bundle: &[u8]) -> RoutingExtensionsSummary {
@@ -1347,5 +1624,303 @@ mod tests {
                 .map(|t| t.path_elements.len()),
             Some(2)
         );
+    }
+
+    #[test]
+    fn derive_return_trajectory_reverses_treb_and_strips_endpoints() {
+        let src: Eid = "dtn://stata/dtnping-1".parse().expect("valid src eid");
+        let dst: Eid = "dtn://statd/echo".parse().expect("valid dst eid");
+        let local: Eid = "dtn://statd/echo".parse().expect("valid local eid");
+
+        let treb = TrebData {
+            hops: vec![
+                TrebHopEntry {
+                    node_eid: "dtn://stata/".to_string(),
+                    arrival_time_ms: Some(1),
+                    departure_time_ms: Some(2),
+                    cla_info: None,
+                },
+                TrebHopEntry {
+                    node_eid: "dtn://statb/".to_string(),
+                    arrival_time_ms: Some(3),
+                    departure_time_ms: Some(4),
+                    cla_info: None,
+                },
+                TrebHopEntry {
+                    node_eid: "dtn://statc/".to_string(),
+                    arrival_time_ms: Some(5),
+                    departure_time_ms: Some(6),
+                    cla_info: None,
+                },
+            ],
+        };
+        let treb_bytes = treb.encode_cbor().expect("encode treb");
+        let mut builder = Builder::new(src, dst).with_payload(b"ping".as_slice().into());
+        builder = builder
+            .add_extension_block(block::Type::Unrecognised(DEFAULT_BLOCK_TYPE_TREB))
+            .expect("add treb")
+            .build(treb_bytes.into_vec().into());
+        let (_bundle, raw) = builder
+            .build(CreationTimestamp::now())
+            .expect("build bundle");
+        let parsed = hardy_bpv7::parse::parse(raw.to_vec().into()).expect("parse");
+
+        let ret = derive_return_trajectory(&parsed.bundle, &parsed.data, &local)
+            .expect("return trajectory expected");
+        assert_eq!(
+            format_aprs_path(&ret.path_elements),
+            "dtn://statc/,dtn://statb/"
+        );
+        assert_eq!(ret.active_hop_index, 0);
+    }
+
+    #[test]
+    fn derive_return_trajectory_falls_back_to_completed_aprs_and_previous_node() {
+        let src: Eid = "dtn://stata/dtnping-1".parse().expect("valid src eid");
+        let dst: Eid = "dtn://statd/echo".parse().expect("valid dst eid");
+        let local: Eid = "dtn://statd/echo".parse().expect("valid local eid");
+
+        // 1. Completed APRS fallback
+        let mesh = MeshRoutingData {
+            trajectory_control: Some(TrajectoryControl {
+                path_elements: vec![
+                    PathElement::Strict(StrictTarget {
+                        target_id: "STATB".to_string(),
+                        completed: true,
+                    }),
+                    PathElement::Alias(ScopedAlias {
+                        scope_name: "VHF".to_string(),
+                        max_count: 1,
+                        remaining_count: 0,
+                        completed: true,
+                        serviced_by: Some("dtn://statc/".to_string()),
+                    }),
+                    PathElement::Strict(StrictTarget {
+                        target_id: "STATD".to_string(),
+                        completed: false,
+                    }),
+                ],
+                active_hop_index: 2,
+                allow_substitution: Some(true),
+            }),
+            ..Default::default()
+        };
+        let mut builder =
+            Builder::new(src.clone(), dst.clone()).with_payload(b"a".as_slice().into());
+        builder = builder
+            .add_extension_block(block::Type::Unrecognised(BLOCK_TYPE_MESH_ROUTING))
+            .expect("add mesh")
+            .build(mesh.encode_cbor().expect("encode mesh").into_vec().into());
+        let (_b, raw) = builder.build(CreationTimestamp::now()).expect("build");
+        let parsed = hardy_bpv7::parse::parse(raw.to_vec().into()).expect("parse");
+        let ret = derive_return_trajectory(&parsed.bundle, &parsed.data, &local)
+            .expect("completed APRS return path");
+        assert_eq!(
+            format_aprs_path(&ret.path_elements),
+            "dtn://statc/,dtn://statb/"
+        );
+
+        // 2. Previous Node (Block 6) fallback
+        let prev_eid: Eid = "dtn://statc/".parse().expect("prev eid");
+        let prev_bytes = hardy_cbor::encode::emit(&prev_eid).0;
+        let mut b2 = Builder::new(src, dst).with_payload(b"b".as_slice().into());
+        b2 = b2
+            .add_extension_block(block::Type::PreviousNode)
+            .expect("add prev node")
+            .build(prev_bytes.into());
+        let (_b2, raw2) = b2.build(CreationTimestamp::now()).expect("build2");
+        let parsed2 = hardy_bpv7::parse::parse(raw2.to_vec().into()).expect("parse2");
+        let ret2 = derive_return_trajectory(&parsed2.bundle, &parsed2.data, &local)
+            .expect("previous node fallback");
+        assert_eq!(format_aprs_path(&ret2.path_elements), "dtn://statc/");
+    }
+
+    #[test]
+    fn derive_return_trajectory_deduplicates_and_caps_hops() {
+        let src: Eid = "dtn://stata/dtnping-1".parse().expect("valid src eid");
+        let dst: Eid = "dtn://statz/echo".parse().expect("valid dst eid");
+        let local: Eid = "dtn://statz/echo".parse().expect("valid local eid");
+
+        let mut hops = Vec::new();
+        for i in 1..=20 {
+            hops.push(TrebHopEntry {
+                node_eid: format!("dtn://relay{i}/"),
+                arrival_time_ms: None,
+                departure_time_ms: None,
+                cla_info: None,
+            });
+            // duplicate hop
+            if i == 5 {
+                hops.push(TrebHopEntry {
+                    node_eid: "dtn://relay5/".to_string(),
+                    arrival_time_ms: None,
+                    departure_time_ms: None,
+                    cla_info: None,
+                });
+            }
+        }
+        let treb = TrebData { hops };
+        let mut builder =
+            Builder::new(src.clone(), dst.clone()).with_payload(b"x".as_slice().into());
+        builder = builder
+            .add_extension_block(block::Type::Unrecognised(DEFAULT_BLOCK_TYPE_TREB))
+            .expect("add treb")
+            .build(treb.encode_cbor().expect("encode").into_vec().into());
+        let (_b, raw) = builder.build(CreationTimestamp::now()).expect("build");
+        let parsed = hardy_bpv7::parse::parse(raw.to_vec().into()).expect("parse");
+
+        let ret = derive_return_trajectory(&parsed.bundle, &parsed.data, &local)
+            .expect("capped return path");
+        assert_eq!(ret.path_elements.len(), MAX_RETURN_TRAJECTORY_HOPS);
+        assert_eq!(
+            ret.path_elements[0],
+            PathElement::Strict(StrictTarget {
+                target_id: "dtn://relay20/".to_string(),
+                completed: false,
+            })
+        );
+
+        // Direct 1-hop (only source in TREB) returns None
+        let direct_treb = TrebData {
+            hops: vec![TrebHopEntry {
+                node_eid: "dtn://stata/".to_string(),
+                arrival_time_ms: None,
+                departure_time_ms: None,
+                cla_info: None,
+            }],
+        };
+        let mut bd = Builder::new(src, dst).with_payload(b"y".as_slice().into());
+        bd = bd
+            .add_extension_block(block::Type::Unrecognised(DEFAULT_BLOCK_TYPE_TREB))
+            .expect("add treb")
+            .build(direct_treb.encode_cbor().expect("encode").into_vec().into());
+        let (_bd, raw_d) = bd.build(CreationTimestamp::now()).expect("build");
+        let parsed_d = hardy_bpv7::parse::parse(raw_d.to_vec().into()).expect("parse");
+        assert!(derive_return_trajectory(&parsed_d.bundle, &parsed_d.data, &local).is_none());
+    }
+
+    #[test]
+    fn attach_empty_treb_and_apply_return_trajectory_roundtrip() {
+        let src: Eid = "dtn://statd/echo".parse().expect("valid src eid");
+        let dst: Eid = "dtn://stata/dtnping-1".parse().expect("valid dst eid");
+        let builder = Builder::new(src, dst).with_payload(b"pong".as_slice().into());
+        let builder = attach_empty_treb(builder).expect("attach empty treb");
+        let builder = apply_return_trajectory(
+            builder,
+            TrajectoryControl {
+                path_elements: vec![PathElement::Strict(StrictTarget {
+                    target_id: "dtn://statc/".to_string(),
+                    completed: false,
+                })],
+                active_hop_index: 0,
+                allow_substitution: Some(true),
+            },
+        )
+        .expect("apply return trajectory");
+        let (_b, raw) = builder.build(CreationTimestamp::now()).expect("build");
+        let parsed = hardy_bpv7::parse::parse(raw.to_vec().into()).expect("parse");
+        let summary = extract_routing_extensions(&parsed.bundle, &parsed.data);
+        assert_eq!(summary.treb, Some(TrebData::default()));
+        assert_eq!(summary.aprs_path_formatted.as_deref(), Some("dtn://statc/"));
+    }
+
+    #[test]
+    fn derive_return_trajectory_sanitizes_injection_and_invalid_hops() {
+        let src: Eid = "dtn://stata/dtnping-1".parse().expect("src");
+        let dst: Eid = "dtn://statd/echo".parse().expect("dst");
+        let local: Eid = "dtn://statd/echo".parse().expect("local");
+
+        let treb = TrebData {
+            hops: vec![
+                TrebHopEntry {
+                    node_eid: "STATB,VHF7-7".to_string(),
+                    arrival_time_ms: None,
+                    departure_time_ms: None,
+                    cla_info: None,
+                },
+                TrebHopEntry {
+                    node_eid: "--malicious-flag".to_string(),
+                    arrival_time_ms: None,
+                    departure_time_ms: None,
+                    cla_info: None,
+                },
+                TrebHopEntry {
+                    node_eid: "VHF7-7".to_string(),
+                    arrival_time_ms: None,
+                    departure_time_ms: None,
+                    cla_info: None,
+                },
+                TrebHopEntry {
+                    node_eid: "STATB".to_string(),
+                    arrival_time_ms: None,
+                    departure_time_ms: None,
+                    cla_info: None,
+                },
+            ],
+        };
+        let mut builder = Builder::new(src, dst).with_payload(b"x".as_slice().into());
+        builder = builder
+            .add_extension_block(block::Type::Unrecognised(DEFAULT_BLOCK_TYPE_TREB))
+            .expect("add treb")
+            .build(treb.encode_cbor().expect("encode").into_vec().into());
+        let (_b, raw) = builder.build(CreationTimestamp::now()).expect("build");
+        let parsed = hardy_bpv7::parse::parse(raw.to_vec().into()).expect("parse");
+
+        let traj = derive_return_trajectory(&parsed.bundle, &parsed.data, &local)
+            .expect("valid hops retained");
+        let formatted = format_aprs_path(&traj.path_elements);
+        assert_eq!(formatted, "dtn://statb/,dtn://vhf7-7/");
+        let reparsed = parse_aprs_path(&formatted).expect("reparse canonical path");
+        assert!(
+            reparsed.iter().all(|e| matches!(e, PathElement::Strict(_))),
+            "canonicalized return hops must always parse as StrictTarget, got {reparsed:?}"
+        );
+    }
+
+    #[test]
+    fn derive_return_trajectory_falls_through_when_treb_has_only_source() {
+        let src: Eid = "dtn://stata/dtnping-1".parse().expect("src");
+        let dst: Eid = "dtn://statc/echo".parse().expect("dst");
+        let local: Eid = "dtn://statc/echo".parse().expect("local");
+
+        let treb = TrebData {
+            hops: vec![TrebHopEntry {
+                node_eid: "dtn://stata/".to_string(),
+                arrival_time_ms: None,
+                departure_time_ms: None,
+                cla_info: None,
+            }],
+        };
+        let prev_eid: Eid = "dtn://statb/".parse().expect("prev");
+        let prev_bytes = hardy_cbor::encode::emit(&prev_eid).0;
+
+        let mut builder = Builder::new(src, dst).with_payload(b"x".as_slice().into());
+        builder = builder
+            .add_extension_block(block::Type::Unrecognised(DEFAULT_BLOCK_TYPE_TREB))
+            .expect("add treb")
+            .build(treb.encode_cbor().expect("encode").into_vec().into());
+        builder = builder
+            .add_extension_block(block::Type::PreviousNode)
+            .expect("add prev")
+            .build(prev_bytes.into());
+        let (_b, raw) = builder.build(CreationTimestamp::now()).expect("build");
+        let parsed = hardy_bpv7::parse::parse(raw.to_vec().into()).expect("parse");
+
+        let plan = derive_reply_routing(&parsed.bundle, &parsed.data, &local);
+        assert!(plan.seed_treb);
+        let traj = plan
+            .return_trajectory
+            .expect("should fall through to Block 6");
+        assert_eq!(format_aprs_path(&traj.path_elements), "dtn://statb/");
+    }
+
+    #[test]
+    fn should_auto_seed_treb_ignores_empty_aprs_path() {
+        assert!(!should_auto_seed_treb(false, None, None));
+        assert!(!should_auto_seed_treb(false, Some(""), None));
+        assert!(!should_auto_seed_treb(false, Some("   "), None));
+        assert!(should_auto_seed_treb(true, None, None));
+        assert!(should_auto_seed_treb(false, Some("STATB"), None));
+        assert!(should_auto_seed_treb(false, None, Some(8)));
     }
 }
